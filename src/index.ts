@@ -97,8 +97,18 @@ const TOOLS: Tool[] = [
       type: "object",
       properties: {
         selector: { type: "string", description: "CSS selector of target element (optional if semanticQuery provided)" },
-        semanticQuery: { type: "string", description: "AXTree semantic role/name query (e.g. 'Amexpapaonly', 'button', 'Profile')" },
       },
+    },
+  },
+  {
+    name: "comet_incognito_tab",
+    description: "Open an isolated Incognito / Private BrowserContext session in a separate window",
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "URL to open inside the private context" },
+      },
+      required: ["url"],
     },
   },
 ];
@@ -483,6 +493,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const semanticQuery = args?.semanticQuery as string | undefined;
         const smartRes = await cometClient.verifiedSmartClick({ selector, semanticQuery });
         return { content: [{ type: "text", text: smartRes }] };
+      }
+
+      case "comet_incognito_tab": {
+        const url = args?.url as string;
+        const incognitoRes = await cometClient.openIncognitoTab(url);
+        return { content: [{ type: "text", text: JSON.stringify(incognitoRes, null, 2) }] };
       }
 
       default:

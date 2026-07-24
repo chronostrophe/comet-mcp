@@ -720,15 +720,75 @@ export class CometCDPClient {
   }
 
   /**
-   * Create a new tab
+   * Navigate inside the current active tab (Same-Tab Context Reuse)
+   */
+  async navigateCurrentTab(url: string): Promise<NavigateResult> {
+    this.ensureConnected();
+    const navResult = await this.client!.Page.navigate({ url });
+    if (navResult.errorText) {
+      throw new Error(`Same-Tab Navigation failed: ${navResult.errorText}`);
+    }
+
+    await new Promise<void>((resolve) => {
+      const onLoad = () => {
+        (this.client as any).removeListener('Page.loadEventFired', onLoad);
+        resolve();
+      };
+      (this.client as any).on('Page.loadEventFired', onLoad);
+    });
+
+    return { frameId: navResult.frameId, loaderId: navResult.loaderId || "" };
+  }
+
+  /**
+   * Create a new tab attached strictly to current window & activate focus
    */
   async newTab(url?: string): Promise<CDPTarget> {
     const response = await windowsFetch(
-      `http://127.0.0.1:${this.state.port}/json/new${url ? `?${url}` : ""}`,
+      `http://127.0.0.1:${this.state.port}/json/new${url ? `?${encodeURIComponent(url)}` : ""}`,
       'PUT'
     );
     if (!response.ok) throw new Error(`Failed to create new tab: ${response.status}`);
-    return response.json() as Promise<CDPTarget>;
+    const target = (await response.json()) as CDPTarget;
+
+    // Immediately activate and focus new tab
+    try {
+      await windowsFetch(`http://127.0.0.1:${this.state.port}/json/activate/${target.id}`, 'GET');
+    } catch { /* ignore activation error */ }
+
+    return target;
+  }
+
+  /**
+   * Open Incognito / Private Session with BrowserContext Isolation
+   */
+  async openIncognitoTab(url: string): Promise<{ targetId: string; browserContextId: string }> {
+    this.ensureConnected();
+
+    // Step 1: Create isolated Incognito BrowserContext via Root Browser CDP
+    const { browserContextId } = await (this.client as any).Target.createBrowserContext({
+      disposeOnDetach: false
+    });
+
+    // Step 2: Open target bound to private context
+    const { targetId } = await (this.client as any).Target.createTarget({
+      url,
+      browserContextId,
+      newWindow: true
+    });
+
+    // Step 3: Focus private window
+    await (this.client as any).Target.activateTarget({ targetId });
+
+    return { targetId, browserContextId };
+  }
+
+  /**
+   * Destroy an Incognito BrowserContext and wipe session state
+   */
+  async closeIncognitoContext(browserContextId: string): Promise<void> {
+    this.ensureConnected();
+    await (this.client as any).Target.disposeBrowserContext({ browserContextId });
   }
 
   /**
