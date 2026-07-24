@@ -781,7 +781,8 @@ export class CometCDPClient {
   }
 
   /**
-   * Create a new tab attached strictly to current window & activate focus
+   * Single-Flight Tab Creator Pattern:
+   * Spawns a single tab via HTTP PUT, activates window focus, and polls /json/list to confirm initialization
    */
   async newTab(url?: string): Promise<CDPTarget> {
     const response = await windowsFetch(
@@ -789,14 +790,24 @@ export class CometCDPClient {
       'PUT'
     );
     if (!response.ok) throw new Error(`Failed to create new tab: ${response.status}`);
-    const target = (await response.json()) as CDPTarget;
+    const newTarget = (await response.json()) as CDPTarget;
 
-    // Immediately activate and focus new tab
+    // Bring tab to front focus
     try {
-      await windowsFetch(`http://127.0.0.1:${this.state.port}/json/activate/${target.id}`, 'GET');
+      await windowsFetch(`http://127.0.0.1:${this.state.port}/json/activate/${newTarget.id}`, 'GET');
     } catch { /* ignore activation error */ }
 
-    return target;
+    // Poll target map until confirmed initialized
+    let attempts = 0;
+    while (attempts < 10) {
+      const targets = await this.listTargets();
+      const confirmed = targets.find((t) => t.id === newTarget.id);
+      if (confirmed) return confirmed;
+      await new Promise((r) => setTimeout(r, 200));
+      attempts++;
+    }
+
+    return newTarget;
   }
 
   /**
