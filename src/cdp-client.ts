@@ -1034,6 +1034,59 @@ export class CometCDPClient {
   }
 
   /**
+   * Guard 1: Window/Profile Pre-Flight Check (isIncognito & hasSidecar Validation)
+   */
+  async validateExecutionEnvironment(): Promise<{ canUseSidecar: boolean; reason?: string; sidecarTargetId?: string }> {
+    const targets = await this.listTargets();
+    const sidecar = targets.find(t =>
+      t.url.includes('/sidecar') ||
+      t.title.toLowerCase().includes('perplexity sidecar') ||
+      t.title.toLowerCase().includes('perplexity')
+    );
+
+    if (!sidecar) {
+      return {
+        canUseSidecar: false,
+        reason: 'No Sidecar target detected. You are in an Incognito window or isolated context without Perplexity auth.'
+      };
+    }
+
+    return { canUseSidecar: true, sidecarTargetId: sidecar.id };
+  }
+
+  /**
+   * Guard 2: Generic Popup & Consent Dialog Dismissal Engine
+   */
+  async dismissBlockingOverlays(): Promise<boolean> {
+    this.ensureConnected();
+    const selectors = [
+      'button[aria-label*="Leave history off"]',
+      'tp-yt-paper-button[aria-label*="Accept"]',
+      '#dismiss-button',
+      '[aria-label*="Accept all"]',
+      'button[aria-label*="Close"]',
+      '.close-button',
+      'button[aria-label*="Dismiss"]'
+    ];
+
+    const evalRes = await this.evaluate(`
+      (() => {
+        const selectors = ${JSON.stringify(selectors)};
+        for (const selector of selectors) {
+          const el = document.querySelector(selector);
+          if (el && (el.offsetWidth > 0 || el.offsetHeight > 0)) {
+            (el).click();
+            return selector;
+          }
+        }
+        return null;
+      })()
+    `);
+
+    return evalRes.result?.value !== null;
+  }
+
+  /**
    * Comet Assistant Sidecar Feature 1: Target Discovery & Isolation for Sidecar
    */
   async findCometSidecarTarget(): Promise<CDPTarget | null> {
@@ -1050,6 +1103,11 @@ export class CometCDPClient {
    * Comet Assistant Sidecar Feature 2: Inject Prompt into Sidecar Textarea
    */
   async sendPromptToSidecar(promptText: string): Promise<string> {
+    const envCheck = await this.validateExecutionEnvironment();
+    if (!envCheck.canUseSidecar) {
+      throw new Error(envCheck.reason);
+    }
+
     const sidecar = await this.findCometSidecarTarget();
     if (!sidecar) throw new Error("Comet Assistant Sidecar target not found.");
 
