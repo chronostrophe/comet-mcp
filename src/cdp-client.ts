@@ -1033,6 +1033,78 @@ export class CometCDPClient {
     return `Emitted push payload to window.onCometEvent`;
   }
 
+  /**
+   * Comet Assistant Sidecar Feature 1: Target Discovery & Isolation for Sidecar
+   */
+  async findCometSidecarTarget(): Promise<CDPTarget | null> {
+    const targets = await this.listTargets();
+    const sidecar = targets.find(t =>
+      t.url.includes('/sidecar') ||
+      t.title.toLowerCase().includes('perplexity sidecar') ||
+      t.title.toLowerCase().includes('perplexity')
+    );
+    return sidecar || null;
+  }
+
+  /**
+   * Comet Assistant Sidecar Feature 2: Inject Prompt into Sidecar Textarea
+   */
+  async sendPromptToSidecar(promptText: string): Promise<string> {
+    const sidecar = await this.findCometSidecarTarget();
+    if (!sidecar) throw new Error("Comet Assistant Sidecar target not found.");
+
+    await this.connect(sidecar.id);
+
+    // Step 1: Inject text into React reactive textarea
+    await this.evaluate(`
+      (() => {
+        const textarea = document.querySelector('textarea, [contenteditable="true"]');
+        if (!textarea) throw new Error('Sidecar prompt input box not found');
+        
+        textarea.focus();
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          window.HTMLTextAreaElement.prototype, 
+          'value'
+        )?.set;
+        if (nativeSetter) {
+          nativeSetter.call(textarea, ${JSON.stringify(promptText)});
+        } else {
+          (textarea).value = ${JSON.stringify(promptText)};
+        }
+        
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        textarea.dispatchEvent(new Event('change', { bubbles: true }));
+        return true;
+      })()
+    `);
+
+    // Step 2: Physical ENTER keypress dispatch
+    await (this.client as any).Input.dispatchKeyEvent({ type: 'keyDown', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' });
+    await (this.client as any).Input.dispatchKeyEvent({ type: 'keyUp', windowsVirtualKeyCode: 13, key: 'Enter', code: 'Enter' });
+
+    return `Prompt successfully injected into Comet Sidecar: "${promptText}"`;
+  }
+
+  /**
+   * Comet Assistant Sidecar Feature 3: Read latest AI response stream
+   */
+  async readSidecarLatestResponse(): Promise<string> {
+    const sidecar = await this.findCometSidecarTarget();
+    if (!sidecar) throw new Error("Comet Assistant Sidecar target not found.");
+
+    await this.connect(sidecar.id);
+
+    const result = await this.evaluate(`
+      (() => {
+        const messages = document.querySelectorAll('[data-testid="answer-text"], .prose, .markdown');
+        if (messages.length === 0) return null;
+        return (messages[messages.length - 1]).innerText;
+      })()
+    `);
+
+    return (result.result?.value as string) || 'No response found in Sidecar stream.';
+  }
+
   private ensureConnected(): void {
     if (!this.client) {
       throw new Error("Not connected to Comet. Call connect() first.");

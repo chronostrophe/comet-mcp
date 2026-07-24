@@ -101,15 +101,20 @@ const TOOLS: Tool[] = [
     },
   },
   {
-    name: "comet_incognito_tab",
-    description: "Open an isolated Incognito / Private BrowserContext session in a separate window",
+    name: "comet_sidecar_prompt",
+    description: "Comet Assistant Sidecar: Inject a prompt directly into Comet's native Assistant side panel",
     inputSchema: {
       type: "object",
       properties: {
-        url: { type: "string", description: "URL to open inside the private context" },
+        prompt: { type: "string", description: "Prompt text to inject into the sidecar" },
       },
-      required: ["url"],
+      required: ["prompt"],
     },
+  },
+  {
+    name: "comet_sidecar_read",
+    description: "Comet Assistant Sidecar: Read the latest streamed AI answer from Comet's side panel",
+    inputSchema: { type: "object", properties: {} },
   },
 ];
 
@@ -499,6 +504,17 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const url = args?.url as string;
         const incognitoRes = await cometClient.openIncognitoTab(url);
         return { content: [{ type: "text", text: JSON.stringify(incognitoRes, null, 2) }] };
+      }
+
+      case "comet_sidecar_prompt": {
+        const prompt = args?.prompt as string;
+        const sidecarRes = await cometClient.sendPromptToSidecar(prompt);
+        return { content: [{ type: "text", text: sidecarRes }] };
+      }
+
+      case "comet_sidecar_read": {
+        const answer = await cometClient.readSidecarLatestResponse();
+        return { content: [{ type: "text", text: answer }] };
       }
 
       default:
