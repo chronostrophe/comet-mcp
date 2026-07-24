@@ -286,13 +286,18 @@ export class CometCDPClient {
       } catch { /* target gone */ }
     }
 
-    // Find best target
+    // Find best target (Defaulting strictly to Primary Authenticated Window Context)
     const targets = await this.listTargets();
-    const target = targets.find(t => t.type === 'page' && t.url.includes('perplexity.ai')) ||
-                   targets.find(t => t.type === 'page' && t.url !== 'about:blank');
+    const primaryTarget = targets.find(t =>
+      t.type === 'page' &&
+      !t.url.includes('sidecar') &&
+      !t.url.includes('chrome-extension') &&
+      (!t.browserContextId || t.browserContextId === 'default') &&
+      t.url !== 'about:blank'
+    ) || targets.find(t => t.type === 'page' && !t.url.includes('sidecar'));
 
-    if (target) {
-      return await this.connect(target.id);
+    if (primaryTarget) {
+      return await this.connect(primaryTarget.id);
     }
 
     throw new Error('No suitable tab found for reconnection');

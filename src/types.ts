@@ -7,6 +7,7 @@ export interface CDPTarget {
   url: string;
   webSocketDebuggerUrl?: string;
   devtoolsFrontendUrl?: string;
+  browserContextId?: string;
 }
 
 export interface CDPVersion {
