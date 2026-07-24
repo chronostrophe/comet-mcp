@@ -595,6 +595,14 @@ export class CometCDPClient {
       this.client.Network.enable(),
     ]);
 
+    // Track network errors & auto-dismiss dialog popups
+    this.client.Page.javascriptDialogOpening(async (params: any) => {
+      console.error(`[CDP Dialog] JS ${params.type} popup: ${params.message}`);
+      try {
+        await this.client?.Page.handleJavaScriptDialog({ accept: true });
+      } catch { /* ignore */ }
+    });
+
     // Set window size for consistent UI
     try {
       const { windowId } = await (this.client as any).Browser.getWindowForTarget({ targetId });
@@ -720,6 +728,72 @@ export class CometCDPClient {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Advanced Browser MCP / Harness Primitives: Get AX Tree Nodes with Computed Box Coordinates
+   */
+  async getAXNodesWithCoordinates(): Promise<any[]> {
+    this.ensureConnected();
+    try {
+      const { nodes } = await (this.client as any).Accessibility.getFullAXTree();
+      const axNodes: any[] = [];
+
+      for (const n of nodes.slice(0, 100)) {
+        if (!n.name?.value && !n.role?.value) continue;
+        if (!n.backendDOMNodeId) continue;
+
+        try {
+          const { model } = await (this.client as any).DOM.getBoxModel({ backendNodeId: n.backendDOMNodeId });
+          if (model && model.content) {
+            const q = model.content;
+            const x = Math.round((q[0] + q[2] + q[4] + q[6]) / 4);
+            const y = Math.round((q[1] + q[3] + q[5] + q[7]) / 4);
+            axNodes.push({
+              backendDOMNodeId: n.backendDOMNodeId,
+              role: n.role?.value,
+              name: n.name?.value,
+              value: n.value?.value,
+              x,
+              y,
+              width: model.width,
+              height: model.height,
+            });
+          }
+        } catch { /* skip non-rendered elements */ }
+      }
+
+      return axNodes;
+    } catch {
+      const evalRes = await this.evaluate(`
+        (() => {
+          const els = Array.from(document.querySelectorAll('a, button, input, select, textarea, [role], h1, h2, h3'));
+          return els.slice(0, 100).map((el, i) => {
+            const rect = el.getBoundingClientRect();
+            return {
+              backendDOMNodeId: i + 1,
+              role: el.getAttribute('role') || el.tagName.toLowerCase(),
+              name: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('placeholder') || '').trim().substring(0, 80),
+              x: Math.round(rect.left + rect.width / 2),
+              y: Math.round(rect.top + rect.height / 2),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height)
+            };
+          }).filter(n => n.name.length > 0 && n.width > 0 && n.height > 0);
+        })()
+      `);
+      return (evalRes.result?.value as any[]) || [];
+    }
+  }
+
+  /**
+   * Advanced Browser MCP / Harness Primitives: Direct Compositor Click at (x, y) Viewport Coordinates
+   */
+  async clickAtXY(x: number, y: number): Promise<string> {
+    this.ensureConnected();
+    await (this.client as any).Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+    await (this.client as any).Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+    return `Compositor click dispatched at (${x}, ${y})`;
   }
 
   private ensureConnected(): void {

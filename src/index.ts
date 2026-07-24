@@ -62,6 +62,23 @@ const TOOLS: Tool[] = [
       },
     },
   },
+  {
+    name: "comet_ax_tree_coords",
+    description: "Browser-Harness Primitive: Get AX tree nodes with box model (x, y) coordinates",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "comet_click_xy",
+    description: "Browser-Harness Primitive: Dispatch compositor click directly at (x, y) coordinates",
+    inputSchema: {
+      type: "object",
+      properties: {
+        x: { type: "number", description: "Viewport X coordinate in pixels" },
+        y: { type: "number", description: "Viewport Y coordinate in pixels" },
+      },
+      required: ["x", "y"],
+    },
+  },
 ];
 
 const server = new Server(
@@ -419,6 +436,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             isError: true,
           };
         }
+      }
+
+      case "comet_ax_tree_coords": {
+        const axNodes = await cometClient.getAXNodesWithCoordinates();
+        return { content: [{ type: "text", text: JSON.stringify(axNodes, null, 2) }] };
+      }
+
+      case "comet_click_xy": {
+        const x = args?.x as number;
+        const y = args?.y as number;
+        const clickRes = await cometClient.clickAtXY(x, y);
+        return { content: [{ type: "text", text: clickRes }] };
       }
 
       default:
