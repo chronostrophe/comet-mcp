@@ -167,6 +167,8 @@ export class CometCDPClient {
   private state: CometState = {
     connected: false,
     port: DEFAULT_PORT,
+    sidecarConnected: false,
+    isIncognitoSession: false,
   };
   private lastTargetId: string | undefined;
   private reconnectAttempts: number = 0;
