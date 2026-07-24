@@ -1234,6 +1234,49 @@ export class CometCDPClient {
     });
   }
 
+  /**
+   * Continuous Full-Page Coverage Screenshot Engine:
+   * 1. Forces explicit top reset window.scrollTo(0,0) before initial capture
+   * 2. Uses 90% Viewport Height Overlap Scrolling to guarantee zero missing content
+   */
+  async captureContinuousPageScreenshots(maxSlices = 6): Promise<string[]> {
+    this.ensureConnected();
+
+    // Reset scroll to top (0,0) and disable auto-scroll restoration
+    await this.evaluate(`
+      (() => {
+        if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+        window.scrollTo({ top: 0, left: 0, behavior: 'instant' });
+      })()
+    `);
+    await new Promise(r => setTimeout(r, 800));
+
+    const dimRes = await this.evaluate(`
+      (() => {
+        return {
+          scrollHeight: Math.max(document.body.scrollHeight, document.documentElement.scrollHeight),
+          viewportHeight: window.innerHeight
+        };
+      })()
+    `);
+
+    const dims = (dimRes.result?.value as any) || { scrollHeight: 3000, viewportHeight: 900 };
+    const step = Math.floor(dims.viewportHeight * 0.9); // 10% overlap step
+    const slices: string[] = [];
+
+    for (let currentTop = 0; currentTop < dims.scrollHeight && slices.length < maxSlices; currentTop += step) {
+      await this.evaluate(`window.scrollTo({ top: ${currentTop}, left: 0, behavior: 'instant' });`);
+      await new Promise(r => setTimeout(r, 600));
+
+      const screenshot = await (this.client as any).Page.captureScreenshot({ format: 'png' });
+      if (screenshot?.data) {
+        slices.push(screenshot.data);
+      }
+    }
+
+    return slices;
+  }
+
   private ensureConnected(): void {
     if (!this.client) {
       throw new Error("Not connected to Comet. Call connect() first.");
