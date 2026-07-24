@@ -1181,6 +1181,30 @@ export class CometCDPClient {
     return (result.result?.value as string) || 'No response found in Sidecar stream.';
   }
 
+  /**
+   * Pure CDP Control Strategy (Scenario 1): High-Speed Network Payload Interception
+   */
+  async interceptNetworkData(urlPattern: string): Promise<string> {
+    this.ensureConnected();
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => resolve('No matching payload intercepted within 5s'), 5000);
+      
+      const handler = async (params: any) => {
+        if (params.response.url.includes(urlPattern) || params.response.mimeType.includes('application/json')) {
+          try {
+            const { body, base64Encoded } = await (this.client as any).Network.getResponseBody({ requestId: params.requestId });
+            clearTimeout(timeout);
+            (this.client as any).removeListener('Network.responseReceived', handler);
+            const data = base64Encoded ? Buffer.from(body, 'base64').toString() : body;
+            resolve(data.substring(0, 2000));
+          } catch { /* skip */ }
+        }
+      };
+
+      (this.client as any).on('Network.responseReceived', handler);
+    });
+  }
+
   private ensureConnected(): void {
     if (!this.client) {
       throw new Error("Not connected to Comet. Call connect() first.");
