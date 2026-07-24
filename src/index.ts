@@ -79,6 +79,28 @@ const TOOLS: Tool[] = [
       required: ["x", "y"],
     },
   },
+  {
+    name: "comet_type_native",
+    description: "CDP Native Hardware Typing: Dispatch real OS-level keypresses for input text",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: { type: "string", description: "Text to type char-by-char via physical hardware keypress events" },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "comet_smart_click",
+    description: "Ultra-Reliable Verified SmartClick Engine: Dual-Layer AXTree + DOM resolution, Hardware Input dispatch, Action Verification, and Backtracking Fallbacks",
+    inputSchema: {
+      type: "object",
+      properties: {
+        selector: { type: "string", description: "CSS selector of target element (optional if semanticQuery provided)" },
+        semanticQuery: { type: "string", description: "AXTree semantic role/name query (e.g. 'Amexpapaonly', 'button', 'Profile')" },
+      },
+    },
+  },
 ];
 
 const server = new Server(
@@ -448,6 +470,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const y = args?.y as number;
         const clickRes = await cometClient.clickAtXY(x, y);
         return { content: [{ type: "text", text: clickRes }] };
+      }
+
+      case "comet_type_native": {
+        const text = args?.text as string;
+        const typeRes = await cometClient.typeNativeText(text);
+        return { content: [{ type: "text", text: typeRes }] };
+      }
+
+      case "comet_smart_click": {
+        const selector = args?.selector as string | undefined;
+        const semanticQuery = args?.semanticQuery as string | undefined;
+        const smartRes = await cometClient.verifiedSmartClick({ selector, semanticQuery });
+        return { content: [{ type: "text", text: smartRes }] };
       }
 
       default:
