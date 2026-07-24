@@ -116,6 +116,16 @@ const TOOLS: Tool[] = [
     description: "Comet Assistant Sidecar: Read the latest streamed AI answer from Comet's side panel",
     inputSchema: { type: "object", properties: {} },
   },
+  {
+    name: "comet_continuous_screenshots",
+    description: "Continuous Coverage Screenshot Engine: Captures sequential 90% viewport overlap PNG screenshots down the document",
+    inputSchema: {
+      type: "object",
+      properties: {
+        maxSlices: { type: "number", description: "Maximum number of section screenshots to capture (default: 6)" }
+      }
+    }
+  },
 ];
 
 const server = new Server(
@@ -515,6 +525,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "comet_sidecar_read": {
         const answer = await cometClient.readSidecarLatestResponse();
         return { content: [{ type: "text", text: answer }] };
+      }
+
+      case "comet_continuous_screenshots": {
+        const maxSlices = (args?.maxSlices as number) || 6;
+        const slices = await cometClient.captureContinuousPageScreenshots(maxSlices);
+        return { content: [{ type: "text", text: `Captured ${slices.length} continuous viewport screenshots with 10% overlap.` }] };
       }
 
       default:
