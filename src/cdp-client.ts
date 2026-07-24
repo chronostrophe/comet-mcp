@@ -288,21 +288,50 @@ export class CometCDPClient {
       } catch { /* target gone */ }
     }
 
-    // Find best target (Defaulting strictly to Primary Authenticated Window Context)
-    const targets = await this.listTargets();
-    const primaryTarget = targets.find(t =>
-      t.type === 'page' &&
-      !t.url.includes('sidecar') &&
-      !t.url.includes('chrome-extension') &&
-      (!t.browserContextId || t.browserContextId === 'default') &&
-      t.url !== 'about:blank'
-    ) || targets.find(t => t.type === 'page' && !t.url.includes('sidecar'));
+    // Connect to best target using Production Target Selection Guard
+    const target = await this.getActiveFocusedPageTarget({ mustBeDefaultContext: true, activateOnSelect: true });
+    return await this.connect(target.id);
+  }
 
-    if (primaryTarget) {
-      return await this.connect(primaryTarget.id);
+  /**
+   * Production Target Selection Guard:
+   * 1. Filter out background pages, webviews, extensions & sidecars
+   * 2. URL Domain Matching -> Default Window Context -> Active Tab
+   * 3. Mandatory Focus Activation via GET /json/activate/<id>
+   */
+  async getActiveFocusedPageTarget(options: { urlMatch?: string; mustBeDefaultContext?: boolean; activateOnSelect?: boolean } = {}): Promise<CDPTarget> {
+    const targets = await this.listTargets();
+    const pageTargets = targets.filter(t =>
+      t.type === 'page' &&
+      !t.url.includes('chrome-extension://') &&
+      !t.url.includes('/sidecar')
+    );
+
+    if (pageTargets.length === 0) {
+      throw new Error('No valid page targets found.');
     }
 
-    throw new Error('No suitable tab found for reconnection');
+    let selectedTarget: CDPTarget | undefined = undefined;
+
+    if (options.urlMatch) {
+      selectedTarget = pageTargets.find(t => t.url.toLowerCase().includes(options.urlMatch!.toLowerCase()));
+    }
+
+    if (!selectedTarget && options.mustBeDefaultContext) {
+      selectedTarget = pageTargets.find(t => !t.browserContextId || t.browserContextId === 'default');
+    }
+
+    if (!selectedTarget) {
+      selectedTarget = pageTargets[0];
+    }
+
+    if (options.activateOnSelect && selectedTarget) {
+      try {
+        await windowsFetch(`http://127.0.0.1:${this.state.port}/json/activate/${selectedTarget.id}`, 'GET');
+      } catch { /* continue */ }
+    }
+
+    return selectedTarget;
   }
 
   /**
