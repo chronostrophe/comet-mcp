@@ -598,6 +598,28 @@ export class CometCDPClient {
       (this.client as any).Accessibility.enable(),
     ]);
 
+    // Technique 1: Auto-Attach to Popups, OAuth Flows & Iframes
+    try {
+      await (this.client as any).Target.setAutoAttach({
+        autoAttach: true,
+        waitForDebuggerOnStart: false,
+        flatten: true
+      });
+      (this.client as any).Target.attachedToTarget(async ({ sessionId, targetInfo }: any) => {
+        console.log(`[CDP Auto-Attach] Attached to ${targetInfo.type}: ${targetInfo.url} (Session: ${sessionId})`);
+      });
+    } catch { /* continue */ }
+
+    // Technique 4: Push Binding (window.onCometEvent)
+    try {
+      await (this.client as any).Runtime.addBinding({ name: 'onCometEvent' });
+      (this.client as any).Runtime.bindingCalled((event: any) => {
+        if (event.name === 'onCometEvent') {
+          console.log('[CDP Push Event] Browser Payload:', event.payload);
+        }
+      });
+    } catch { /* continue */ }
+
     // Anti-Bot & Environment Spoofing Script injection
     try {
       await (this.client as any).Page.addScriptToEvaluateOnNewDocument({
@@ -614,6 +636,17 @@ export class CometCDPClient {
       try {
         await this.client?.Page.handleJavaScriptDialog({ accept: true });
       } catch { /* ignore */ }
+    });
+
+    // Technique 2: Direct API Data Interception (Network.getResponseBody)
+    (this.client as any).Network.responseReceived(async (params: any) => {
+      const { requestId, response } = params;
+      if (response.url.includes('/api/') || response.mimeType.includes('application/json')) {
+        try {
+          const { body } = await (this.client as any).Network.getResponseBody({ requestId });
+          // Parsed API Payload cached for zero-DOM data extraction
+        } catch { /* garbage collected */ }
+      }
     });
 
     // Handle Fetch requests to continue normal traffic
@@ -968,6 +1001,36 @@ export class CometCDPClient {
     }
 
     return `Verified Click Executed on ${coords.label} at (${coords.x}, ${coords.y}) with Backtracking fallback.`;
+  }
+
+  /**
+   * Technique 3: Export session cookies for authentication state preservation
+   */
+  async exportCookies(urls?: string[]): Promise<any[]> {
+    this.ensureConnected();
+    const { cookies } = await (this.client as any).Network.getCookies({ urls });
+    return cookies;
+  }
+
+  /**
+   * Technique 3: Inject pre-authenticated cookies into clean/incognito contexts
+   */
+  async injectCookies(cookies: any[]): Promise<void> {
+    this.ensureConnected();
+    await (this.client as any).Network.setCookies({ cookies });
+  }
+
+  /**
+   * Technique 4: Trigger native in-page Push Event binding (window.onCometEvent)
+   */
+  async emitPushEvent(payload: Record<string, any>): Promise<string> {
+    this.ensureConnected();
+    await this.evaluate(`
+      if (typeof window.onCometEvent === 'function') {
+        window.onCometEvent(JSON.stringify(${JSON.stringify(payload)}));
+      }
+    `);
+    return `Emitted push payload to window.onCometEvent`;
   }
 
   private ensureConnected(): void {
