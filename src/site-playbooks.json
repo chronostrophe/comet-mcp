@@ -153,7 +153,7 @@
   },
   {
     "domain": "perplexity.ai",
-    "skill": "Perplexity Assistant Sidecar Universal Invariant:\n- Presence: The Perplexity Assistant Sidecar (`https://www.perplexity.ai/sidecar`) is present on EVERY website in normal Comet windows (Private/Incognito windows excluded).\n- Prompt Composer: `DIV#ask-input`. Focus, insert query, and send via `Enter` keydown.\n- Non-Disruptive Context: Query or submit to sidecar without leaving active page tab.",
+    "skill": "Perplexity Assistant Sidecar Universal Invariant & Routing:\n- Presence: Present on EVERY website in normal Comet windows (`https://www.perplexity.ai/sidecar`).\n- React Input Handshake: Must dispatch native input events on `#ask-input` to register React state.\n- Dynamic Search Sub-Route: Hitting `Enter` mutates the sidecar URL to `https://www.perplexity.ai/sidecar/search/{uuid}`. Always capture the new search sub-target for streaming output extraction.",
     "lastVerified": "2026-07-24",
     "goldenTasks": "evals/domain/perplexity.ai.yaml"
   },
