@@ -1404,13 +1404,19 @@ export class CometCDPClient {
    * and logs user interactions to `learned-playbooks.json` automatically for AI study & replay.
    */
   /**
-   * Passive Learning Recorder Engine (Upgraded with Page.addScriptToEvaluateOnNewDocument):
-   * 1. Uses CDP Page.addScriptToEvaluateOnNewDocument to auto-reinject listeners across every navigation.
-   * 2. Captures physical clicks, text inputs, scrolls, and hotkeys across all domain transitions.
+   * Passive Learning Recorder Engine (Runtime.addBinding IPC Telemetry Stream):
+   * 1. Uses Runtime.addBinding({ name: '__cometTelemetry__' }) to establish a native IPC bridge between Chromium and comet-server.
+   * 2. Auto-injects listener via Page.addScriptToEvaluateOnNewDocument for 100% cross-navigation persistence.
    */
   async startPassiveLearningRecorder(): Promise<{ listening: boolean }> {
     this.ensureConnected();
 
+    // 1. Establish native Runtime binding IPC bridge
+    try {
+      await (this.client as any).Runtime.addBinding({ name: "__cometTelemetry__" });
+    } catch { /* binding may already exist */ }
+
+    // 2. Continuous telemetry source script
     const scriptSource = `
       (() => {
         window.__COMET_PASSIVE_LEARNING_ACTIVE__ = true;
@@ -1436,10 +1442,13 @@ export class CometCDPClient {
           };
 
           window.__COMET_RECORDED_EVENTS__.push(eventData);
-          console.log('[Comet Passive Telemetry]', eventData);
+          if (typeof window.__cometTelemetry__ === 'function') {
+            window.__cometTelemetry__(JSON.stringify(eventData));
+          }
+          console.log('[Comet Passive Telemetry Bridge]', eventData);
         };
 
-        document.addEventListener('click', (e) => logEvent(e, 'click'), true);
+        document.addEventListener('pointerdown', (e) => logEvent(e, 'click'), true);
         document.addEventListener('change', (e) => logEvent(e, 'change'), true);
         document.addEventListener('input', (e) => logEvent(e, 'input'), true);
       })()
