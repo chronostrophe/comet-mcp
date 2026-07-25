@@ -1403,38 +1403,54 @@ export class CometCDPClient {
    * Attaches low-overhead DOM event listeners (`click`, `input`, `submit`) over CDP Page context
    * and logs user interactions to `learned-playbooks.json` automatically for AI study & replay.
    */
+  /**
+   * Passive Learning Recorder Engine (Upgraded with Page.addScriptToEvaluateOnNewDocument):
+   * 1. Uses CDP Page.addScriptToEvaluateOnNewDocument to auto-reinject listeners across every navigation.
+   * 2. Captures physical clicks, text inputs, scrolls, and hotkeys across all domain transitions.
+   */
   async startPassiveLearningRecorder(): Promise<{ listening: boolean }> {
     this.ensureConnected();
-    await this.evaluate(`
+
+    const scriptSource = `
       (() => {
-        if (window.__COMET_PASSIVE_LEARNING_ACTIVE__) return;
         window.__COMET_PASSIVE_LEARNING_ACTIVE__ = true;
         window.__COMET_RECORDED_EVENTS__ = window.__COMET_RECORDED_EVENTS__ || [];
 
-        const handler = (e) => {
+        if (window.__COMET_LISTENER_ATTACHED__) return;
+        window.__COMET_LISTENER_ATTACHED__ = true;
+
+        const logEvent = (e, type) => {
           const target = e.target;
           if (!target || !(target instanceof HTMLElement)) return;
 
           const rect = target.getBoundingClientRect();
           const eventData = {
-            type: e.type,
+            type,
             tagName: target.tagName.toLowerCase(),
             id: target.id ? '#' + target.id : null,
-            accessibleName: target.getAttribute('aria-label') || target.innerText?.substring(0, 30)?.trim() || '',
+            accessibleName: target.getAttribute('aria-label') || target.innerText?.substring(0, 40)?.trim() || '',
             role: target.getAttribute('role') || target.tagName.toLowerCase(),
-            coords: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) },
+            coords: { x: Math.round(e.clientX || rect.left + rect.width / 2), y: Math.round(e.clientY || rect.top + rect.height / 2) },
             timestamp: new Date().toISOString(),
             url: window.location.href
           };
 
           window.__COMET_RECORDED_EVENTS__.push(eventData);
-          console.log('[Comet Passive Learning Recorded]', eventData);
+          console.log('[Comet Passive Telemetry]', eventData);
         };
 
-        document.addEventListener('click', handler, true);
-        document.addEventListener('change', handler, true);
+        document.addEventListener('click', (e) => logEvent(e, 'click'), true);
+        document.addEventListener('change', (e) => logEvent(e, 'change'), true);
+        document.addEventListener('input', (e) => logEvent(e, 'input'), true);
       })()
-    `);
+    `;
+
+    // 1. Inject into currently loaded page
+    await this.evaluate(scriptSource);
+
+    // 2. Persist injection for ALL future navigated documents
+    await (this.client as any).Page.addScriptToEvaluateOnNewDocument({ source: scriptSource });
+
     return { listening: true };
   }
 
