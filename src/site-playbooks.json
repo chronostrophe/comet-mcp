@@ -153,7 +153,7 @@
   },
   {
     "domain": "perplexity.ai",
-    "skill": "Perplexity Assistant Sidecar Universal Invariant & Routing:\n- Presence: Present on EVERY website in normal Comet windows (`https://www.perplexity.ai/sidecar`).\n- React Input Handshake: Must dispatch native input events on `#ask-input` to register React state.\n- Dynamic Search Sub-Route: Hitting `Enter` mutates the sidecar URL to `https://www.perplexity.ai/sidecar/search/{uuid}`. Always capture the new search sub-target for streaming output extraction.",
+    "skill": "Perplexity Assistant Sidecar Universal Invariant & Routing:\n- Presence: Present on EVERY website in normal Comet windows (`https://www.perplexity.ai/sidecar`).\n- React Input Handshake: Must dispatch native input events on `#ask-input` to register React state.\n- Dynamic Search Sub-Route: Hitting `Enter` mutates the sidecar URL to `https://www.perplexity.ai/sidecar/search/{uuid}`. Always capture the new search sub-target for streaming output extraction.\n- Verbatim Output Policy: UNLESS ASKED FOR EXPLICITLY, GO VERBATIM. Deliver 100% exact, raw, unedited sidecar text without unprompted background knowledge synthesis.",
     "lastVerified": "2026-07-24",
     "goldenTasks": "evals/domain/perplexity.ai.yaml"
   },
