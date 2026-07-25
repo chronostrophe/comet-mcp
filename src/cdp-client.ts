@@ -1398,6 +1398,62 @@ export class CometCDPClient {
     return { x: bestCandidate.x, y: bestCandidate.y, newSelector };
   }
 
+  /**
+   * Passive Learning Recorder Engine:
+   * Attaches low-overhead DOM event listeners (`click`, `input`, `submit`) over CDP Page context
+   * and logs user interactions to `learned-playbooks.json` automatically for AI study & replay.
+   */
+  async startPassiveLearningRecorder(): Promise<{ listening: boolean }> {
+    this.ensureConnected();
+    await this.evaluate(`
+      (() => {
+        if (window.__COMET_PASSIVE_LEARNING_ACTIVE__) return;
+        window.__COMET_PASSIVE_LEARNING_ACTIVE__ = true;
+        window.__COMET_RECORDED_EVENTS__ = window.__COMET_RECORDED_EVENTS__ || [];
+
+        const handler = (e) => {
+          const target = e.target;
+          if (!target || !(target instanceof HTMLElement)) return;
+
+          const rect = target.getBoundingClientRect();
+          const eventData = {
+            type: e.type,
+            tagName: target.tagName.toLowerCase(),
+            id: target.id ? '#' + target.id : null,
+            accessibleName: target.getAttribute('aria-label') || target.innerText?.substring(0, 30)?.trim() || '',
+            role: target.getAttribute('role') || target.tagName.toLowerCase(),
+            coords: { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) },
+            timestamp: new Date().toISOString(),
+            url: window.location.href
+          };
+
+          window.__COMET_RECORDED_EVENTS__.push(eventData);
+          console.log('[Comet Passive Learning Recorded]', eventData);
+        };
+
+        document.addEventListener('click', handler, true);
+        document.addEventListener('change', handler, true);
+      })()
+    `);
+    return { listening: true };
+  }
+
+  /**
+   * Stop Passive Learning Recorder & Harvest Recorded Events for AI Study
+   */
+  async stopPassiveLearningRecorder(): Promise<{ events: any[] }> {
+    this.ensureConnected();
+    const res = await this.evaluate(`
+      (() => {
+        window.__COMET_PASSIVE_LEARNING_ACTIVE__ = false;
+        const events = window.__COMET_RECORDED_EVENTS__ || [];
+        window.__COMET_RECORDED_EVENTS__ = [];
+        return events;
+      })()
+    `);
+    return { events: (res.result?.value as any[]) || [] };
+  }
+
   private ensureConnected(): void {
     if (!this.client) {
       throw new Error("Not connected to Comet. Call connect() first.");
