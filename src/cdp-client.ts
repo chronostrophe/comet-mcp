@@ -12,6 +12,7 @@ import type {
   ScreenshotResult,
   EvaluateResult,
   CometState,
+  ElementFingerprint,
 } from "./types.js";
 import sitePlaybooks from "./site-playbooks.json" with { type: "json" };
 
@@ -1317,8 +1318,84 @@ export class CometCDPClient {
         return (${expression});
       })()
     ` : expression;
-
     return this.safeEvaluate(injectedExpression);
+  }
+
+  /**
+   * Intent-Cache-Heal Engine 1: Fast Path Execution (< 10ms)
+   * Bypasses LLM & DOM parsing by replaying known element fingerprint
+   */
+  async executeFastPath(fingerprint: ElementFingerprint): Promise<{ success: boolean; x?: number; y?: number }> {
+    this.ensureConnected();
+    const evalRes = await this.evaluate(`
+      (() => {
+        const el = document.querySelector(${JSON.stringify(fingerprint.primarySelector)});
+        if (!el) return null;
+        const rect = el.getBoundingClientRect();
+        return (rect.width > 0 && rect.height > 0) ? { x: Math.round(rect.left + rect.width / 2), y: Math.round(rect.top + rect.height / 2) } : null;
+      })()
+    `);
+
+    const coords = evalRes.result?.value as { x: number; y: number } | null;
+    if (coords && coords.x > 0 && coords.y > 0) {
+      await this.clickAtXY(coords.x, coords.y);
+      return { success: true, x: coords.x, y: coords.y };
+    }
+    return { success: false };
+  }
+
+  /**
+   * Intent-Cache-Heal Engine 2: State Assertion & Drift Detector
+   */
+  async verifyActionEffect(effect: ElementFingerprint['expectedEffect'], beforeState: { url: string }): Promise<boolean> {
+    await new Promise(r => setTimeout(r, 200));
+
+    if (effect.type === 'url_change') {
+      const currentUrl = (await this.evaluate('window.location.href')).result?.value as string;
+      return currentUrl !== beforeState.url;
+    }
+
+    if (effect.type === 'dom_mutation' && effect.targetValue) {
+      const mutated = await this.evaluate(`!!document.querySelector(${JSON.stringify(effect.targetValue)})`);
+      return !!mutated.result?.value;
+    }
+
+    return true;
+  }
+
+  /**
+   * Intent-Cache-Heal Engine 3: Self-Healing Re-Discovery Engine (Path B)
+   * Scans Accessibility Tree & scores candidates to recover broken selectors
+   */
+  async healBrokenElement(fingerprint: ElementFingerprint): Promise<{ x: number; y: number; newSelector: string }> {
+    console.warn(`[Self-Healing] Drift detected for "${fingerprint.accessibleName}". Initiating AXTree recovery...`);
+
+    const nodes = await this.getAXNodesWithCoordinates();
+    let bestCandidate: any = null;
+    let highestScore = 0;
+
+    for (const node of nodes) {
+      if (fingerprint.role && node.role?.toLowerCase() !== fingerprint.role.toLowerCase()) continue;
+
+      let score = 0;
+      const name = String(node.name || '').toLowerCase();
+      const targetName = fingerprint.accessibleName.toLowerCase();
+
+      if (name === targetName) score += 50;
+      else if (name.includes(targetName) || targetName.includes(name)) score += 30;
+
+      if (score > highestScore) {
+        highestScore = score;
+        bestCandidate = node;
+      }
+    }
+
+    if (!bestCandidate || highestScore < 30) {
+      throw new Error(`Self-healing failed: No matching AXNode element found for "${fingerprint.accessibleName}".`);
+    }
+
+    const newSelector = `[aria-label="${bestCandidate.name}"], [role="${bestCandidate.role}"]`;
+    return { x: bestCandidate.x, y: bestCandidate.y, newSelector };
   }
 
   private ensureConnected(): void {
