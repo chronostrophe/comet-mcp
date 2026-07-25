@@ -1484,6 +1484,60 @@ export class CometCDPClient {
       throw new Error("Not connected to Comet. Call connect() first.");
     }
   }
+
+  /**
+   * Reliable CDP Physical Click for Modern UI Frameworks (Angular/Lit/React)
+   * Dispatches native hardware mouseMoved, mousePressed, and mouseReleased events with isTrusted: true.
+   */
+  async clickGeminiSendButton(): Promise<boolean> {
+    this.ensureConnected();
+
+    const getCoordsScript = `
+      (function() {
+        const btn = document.querySelector('button.send-button, button[aria-label*="Send"], button[aria-label*="Envoyer"], button[aria-label*="Submit"], button.bg-primary');
+        if (!btn) return null;
+        const rect = btn.getBoundingClientRect();
+        return {
+          x: Math.round(rect.left + rect.width / 2),
+          y: Math.round(rect.top + rect.height / 2)
+        };
+      })()
+    `;
+
+    const res = await this.evaluate(getCoordsScript);
+    const coords = res.result?.value as { x: number; y: number } | null;
+
+    if (!coords || !coords.x || !coords.y) {
+      console.error('[Automation Error] Could not locate the send button in the DOM.');
+      return false;
+    }
+
+    // Dispatch native physical mouse events (isTrusted: true)
+    await (this.client as any).Input.dispatchMouseEvent({
+      type: 'mouseMoved',
+      x: coords.x,
+      y: coords.y
+    });
+
+    await (this.client as any).Input.dispatchMouseEvent({
+      type: 'mousePressed',
+      x: coords.x,
+      y: coords.y,
+      button: 'left',
+      clickCount: 1
+    });
+
+    await (this.client as any).Input.dispatchMouseEvent({
+      type: 'mouseReleased',
+      x: coords.x,
+      y: coords.y,
+      button: 'left',
+      clickCount: 1
+    });
+
+    console.log(`[Automation Success] Dispatched native click at (${coords.x}, ${coords.y})`);
+    return true;
+  }
 }
 
 export const cometClient = new CometCDPClient();
