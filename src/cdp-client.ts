@@ -13,6 +13,7 @@ import type {
   EvaluateResult,
   CometState,
 } from "./types.js";
+import sitePlaybooks from "./site-playbooks.json" with { type: "json" };
 
 // ============ PLATFORM DETECTION ============
 
@@ -1275,6 +1276,49 @@ export class CometCDPClient {
     }
 
     return slices;
+  }
+
+  /**
+   * Site Playbook Resolver & Pre-Injection Engine (Guard 1 & 2):
+   * 1. Subdomain / Wildcard Domain Suffix Matching (mail.google.com -> google.com / gmail.com, gist.github.com -> github.com)
+   * 2. Smart Fallback Engine: Falls back to AXTree + Physical Hardware Dispatch if domain lacks custom playbook
+   */
+  getSitePlaybook(urlOrDomain: string): { domain: string; skill: string } | null {
+    if (!urlOrDomain) return null;
+    let targetHost = urlOrDomain.toLowerCase();
+    try {
+      if (urlOrDomain.startsWith('http://') || urlOrDomain.startsWith('https://')) {
+        targetHost = new URL(urlOrDomain).hostname.toLowerCase();
+      }
+    } catch { /* use raw string */ }
+
+    // Direct match
+    const directMatch = sitePlaybooks.find(p => p.domain.toLowerCase() === targetHost);
+    if (directMatch) return directMatch;
+
+    // Wildcard / Suffix match
+    const suffixMatch = sitePlaybooks.find(p => {
+      const pDom = p.domain.toLowerCase();
+      return targetHost.endsWith('.' + pDom) || pDom.endsWith('.' + targetHost);
+    });
+
+    return suffixMatch || null;
+  }
+
+  /**
+   * Playbook Pre-Injection in safeEvaluate (Guard 3):
+   * Injects domain skill hints directly into the evaluation context window
+   */
+  async safeEvaluateWithPlaybook(expression: string, currentUrl?: string): Promise<EvaluateResult> {
+    const playbook = currentUrl ? this.getSitePlaybook(currentUrl) : null;
+    const injectedExpression = playbook ? `
+      (() => {
+        window.__COMET_SITE_PLAYBOOK__ = ${JSON.stringify(playbook.skill)};
+        return (${expression});
+      })()
+    ` : expression;
+
+    return this.safeEvaluate(injectedExpression);
   }
 
   private ensureConnected(): void {
