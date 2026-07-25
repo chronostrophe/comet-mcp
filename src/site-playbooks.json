@@ -147,9 +147,15 @@
   },
   {
     "domain": "youtube.com",
-    "skill": "YouTube UI patterns:\n- Search bar: `input[id=\"search\"], input[name=\"search_query\"]`. Type search term and trigger form submit.\n- First video card: `ytd-video-renderer a#video-title, a[href*=\"/watch?v=\"]`. Use physical CDP mouse events to click.\n- Consent & History Overlay: Dismiss via `button[aria-label*=\"Leave history off\"], #dismiss-button` before evaluating DOM.\n- Context Locking: Once video is opened (`watch?v=`), NEVER navigate away. Connect to native Sidecar (`/sidecar`) to query player state and transcript details.",
+    "skill": "YouTube Learned Interaction Fingerprints & Event Taxonomy:\n- Search bar: `DIV.ytSearchboxComponentInputBox` or `input[name=\"search_query\"]`.\n- Fullscreen Toggle: `.ytp-fullscreen-button` (click to enter/exit fullscreen).\n- Progress Scrubbing: `.ytp-progress-bar` (click relative quad offset to seek timeline).\n- Video Play/Pause: `.video-stream.html5-main-video` or `Space / K`.\n- Sidecar Availability: Native Perplexity Assistant Sidecar (`/sidecar`) is active alongside all YouTube watch pages in normal windows.",
     "lastVerified": "2026-07-24",
     "goldenTasks": "evals/domain/youtube.com.yaml"
+  },
+  {
+    "domain": "perplexity.ai",
+    "skill": "Perplexity Assistant Sidecar Universal Invariant:\n- Presence: The Perplexity Assistant Sidecar (`https://www.perplexity.ai/sidecar`) is present on EVERY website in normal Comet windows (Private/Incognito windows excluded).\n- Prompt Composer: `DIV#ask-input`. Focus, insert query, and send via `Enter` keydown.\n- Non-Disruptive Context: Query or submit to sidecar without leaving active page tab.",
+    "lastVerified": "2026-07-24",
+    "goldenTasks": "evals/domain/perplexity.ai.yaml"
   },
   {
     "domain": "crunchyroll.com",
