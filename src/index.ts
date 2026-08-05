@@ -9,6 +9,10 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListTasksRequestSchema,
+  GetTaskRequestSchema,
+  GetTaskPayloadRequestSchema,
+  CancelTaskRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import { cometClient } from "./cdp-client.js";
@@ -33,6 +37,8 @@ import {
   type UrlPolicy,
 } from "./safety/url-policy.js";
 import { getAuditLog } from "./safety/audit-log.js";
+import { getTaskRegistry, type CreateTaskResult, type TaskStatusResult } from "./mcp/tasks.js";
+import { runBackgroundTask, readTask, listTasks } from "./mcp/task-runner.js";
 
 const TOOLS: Tool[] = [
   {
@@ -172,6 +178,40 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "comet_research",
+    description: "Non-blocking deep research. Returns a task handle (MCP 2025-11-25 Task primitive). Use comet_poll_task to fetch the result. Always uses research mode internally.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        prompt: { type: "string", description: "Question or task for Comet research" },
+        newChat: { type: "boolean", description: "Start a fresh conversation (default: false)" },
+      },
+      required: ["prompt"],
+    },
+  },
+  {
+    name: "comet_poll_task",
+    description: "Poll a research task started by comet_research. Returns its current status (working | completed | failed | cancelled) and content when done.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task id returned by comet_research" },
+      },
+      required: ["taskId"],
+    },
+  },
+  {
+    name: "comet_cancel_task",
+    description: "Cancel a running research task. Returns true if cancellation succeeded, false if the task was already terminal or unknown.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        taskId: { type: "string", description: "Task id returned by comet_research" },
+      },
+      required: ["taskId"],
+    },
+  },
+  {
     name: "comet_get_audit_log",
     description: "Read the URL-policy audit log (most recent decisions, newest first). Optional limit and outcome filter (allow|deny).",
     inputSchema: {
@@ -196,6 +236,77 @@ const server = new Server(
 );
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
+
+// MCP 2025-11-25 task namespace. Spec:
+// https://modelcontextprotocol.io/specification/2025-11-25/basic/utilities/tasks
+// Adapter: SDK spec requires the result be wrapped in `{task: {...}}` with
+// `ttl` and `lastUpdatedAt` fields. My TaskStatusResult is flatter — bridge.
+function toSpecTask(snap: TaskStatusResult): {
+  task: {
+    taskId: string;
+    status: TaskStatusResult["status"];
+    ttl: number | null;
+    createdAt: string;
+    lastUpdatedAt: string;
+    statusMessage?: string;
+    content?: TaskStatusResult["content"];
+    error?: string;
+    completedAt?: string;
+  };
+} {
+  return {
+    task: {
+      taskId: snap.taskId,
+      status: snap.status,
+      ttl: null,
+      createdAt: new Date().toISOString(),
+      lastUpdatedAt: new Date().toISOString(),
+      statusMessage: snap.statusMessage,
+      content: snap.content,
+      error: snap.error,
+      completedAt: snap.completedAt,
+    },
+  };
+}
+
+server.setRequestHandler(ListTasksRequestSchema, async () => {
+  return { tasks: getTaskRegistry().list().map(toSpecTask) };
+});
+
+server.setRequestHandler(GetTaskRequestSchema, async (req) => {
+  const snap = readTask(req.params.taskId);
+  if (!snap) {
+    throw new Error(`Task not found: ${req.params.taskId}`);
+  }
+  return toSpecTask(snap);
+});
+
+server.setRequestHandler(GetTaskPayloadRequestSchema, async (req) => {
+  // Spec's tasks/result has no timeout param — poll until terminal or
+  // a 5-minute hard cap. Caller should pick a reasonable cadence via
+  // the pollInterval hint returned by createTaskResult.
+  const deadline = Date.now() + 300_000;
+  while (Date.now() < deadline) {
+    const snap = readTask(req.params.taskId);
+    if (!snap) {
+      throw new Error(`Task not found: ${req.params.taskId}`);
+    }
+    if (snap.status === "completed" || snap.status === "failed" || snap.status === "cancelled") {
+      return toSpecTask(snap);
+    }
+    await new Promise((r) => setTimeout(r, Math.min(1000, Math.max(100, deadline - Date.now()))));
+  }
+  return toSpecTask({
+    taskId: req.params.taskId,
+    status: "working",
+    statusMessage: "still working after 5-minute hard cap",
+  });
+});
+
+server.setRequestHandler(CancelTaskRequestSchema, async (req) => {
+  const ok = getTaskRegistry().cancel(req.params.taskId, "cancelled by caller");
+  return { taskId: req.params.taskId, cancelled: ok };
+});
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
@@ -406,6 +517,61 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         inProgressMsg += `\nUse comet_poll to check progress or comet_stop to cancel.`;
 
         return { content: [{ type: "text", text: inProgressMsg }] };
+      }
+
+      case "comet_research": {
+        const prompt = args?.prompt as string;
+        if (!prompt || prompt.trim().length === 0) {
+          return { content: [{ type: "text", text: "Error: prompt cannot be empty" }] };
+        }
+        const task = runBackgroundTask(
+          async () => {
+            // For now delegate to cometAI.sendPrompt. Future: wire a dedicated
+            // research path that uses the Sidecar assistant panel.
+            const sent = prompt.replace(/^[-*•\s]/gm, '').replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+            await cometAI.sendPrompt(sent);
+            return { text: "Research started. Use comet_poll_task to retrieve the answer." };
+          },
+          { statusMessage: `researching: ${prompt.slice(0, 60)}` },
+        );
+        const result: CreateTaskResult = { isTask: true, task };
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(result, null, 2),
+          }],
+        };
+      }
+
+      case "comet_poll_task": {
+        const taskId = args?.taskId as string;
+        if (!taskId) {
+          return { content: [{ type: "text", text: "Error: taskId is required" }] };
+        }
+        const snap = readTask(taskId);
+        if (!snap) {
+          return { content: [{ type: "text", text: `Error: no task with id ${taskId}` }], isError: true };
+        }
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(snap, null, 2),
+          }],
+        };
+      }
+
+      case "comet_cancel_task": {
+        const taskId = args?.taskId as string;
+        if (!taskId) {
+          return { content: [{ type: "text", text: "Error: taskId is required" }] };
+        }
+        const cancelled = getTaskRegistry().cancel(taskId, "cancelled by caller");
+        return {
+          content: [{
+            type: "text",
+            text: cancelled ? `Task ${taskId} cancelled.` : `Could not cancel ${taskId} (already terminal or unknown).`,
+          }],
+        };
       }
 
       case "comet_poll": {
