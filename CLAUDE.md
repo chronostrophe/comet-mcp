@@ -8,6 +8,12 @@ MCP server connecting Claude Code to Perplexity's Comet browser via Chrome DevTo
 Claude Code → MCP Server (index.ts) → CometAI (comet-ai.ts) → CDP Client (cdp-client.ts) → Comet Browser
 ```
 
+## Reliability features
+- **Auto-reconnect** — every `evaluate()`/`safeEvaluate()` call goes through `withAutoReconnect`, which detects connection-class errors (`WebSocket CLOSED`, `ECONNREFUSED`, etc.) and reconnects once with exponential backoff (1s → 5s, 5 attempts). Concurrent failing ops share a single `reconnectPromise` mutex so only one reconnect runs.
+- **Health probe** — `safeEvaluate` runs `isHealthy()` (a `1+1` evaluation with 3s timeout) before every expression. Catches silently dead WebSockets that still report `connected: true`.
+- **Idle timeout cancel** — `startComet`'s WSL/Native/macOS startup polls are guarded by a `settled` flag so recursive `setTimeout` chains stop firing after resolve/reject.
+- **Crashless errors** — `comet_ask` returns an explicit error if the user is not on a Perplexity page instead of crashing on a missing CDP target.
+
 ## 6 Tools
 - `comet_connect` - Start/connect to Comet browser
 - `comet_ask` - Send prompt, wait for response (15s default, use poll for longer)

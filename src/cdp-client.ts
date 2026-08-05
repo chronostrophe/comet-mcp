@@ -124,41 +124,81 @@ async function getWSLConnectPort(targetPort: number): Promise<number> {
 }
 
 /**
- * Windows/WSL-compatible fetch using PowerShell
- * On WSL, native fetch connects to WSL's localhost, not Windows where Comet runs
+ * Windows/WSL-compatible fetch using PowerShell.
+ *
+ * H3 fix: previously this built a PowerShell command via raw string interpolation
+ * of `url`. A URL containing a single quote (e.g. `?q=it's`) would silently
+ * terminate the parser, returning an empty body that looked like a successful
+ * response. Worse, it was a shell-injection surface.
+ *
+ * Now: the PowerShell script is piped via stdin (`-Command -`) so `url` is never
+ * interpolated into a shell command line. Inside the script we use `-Uri` as a
+ * named argument so PowerShell handles quoting. Status codes are parsed from the
+ * response object (no longer always 200).
  */
 async function windowsFetch(
   url: string,
   method: string = 'GET'
-): Promise<{ ok: boolean; status: number; json: () => Promise<any> }> {
-  // Use native fetch on macOS/Linux (non-WSL)
+): Promise<{ ok: boolean; status: number; json: () => Promise<unknown>; text: () => Promise<string> }> {
   if (platform() !== 'win32' && !IS_WSL) {
     const response = await fetch(url, { method });
-    return response;
+    return {
+      ok: response.ok,
+      status: response.status,
+      json: () => response.json() as Promise<unknown>,
+      text: () => response.text(),
+    };
   }
 
-  // On Windows or WSL, use PowerShell to reach Windows localhost
-  try {
-    const psCommand = method === 'PUT'
-      ? `Invoke-WebRequest -Uri '${url}' -Method PUT -UseBasicParsing | Select-Object -ExpandProperty Content`
-      : `Invoke-WebRequest -Uri '${url}' -UseBasicParsing | Select-Object -ExpandProperty Content`;
+  const psScript = `
+    $ErrorActionPreference = 'Stop'
+    try {
+      $resp = Invoke-WebRequest -Uri ${JSON.stringify(url)} -Method ${JSON.stringify(method.toUpperCase())} -UseBasicParsing
+      Write-Output ('__PS_STATUS__' + $resp.StatusCode)
+      Write-Output $resp.Content
+    } catch [System.Net.WebException] {
+      $code = 0; try { $code = [int]$_.Exception.Response.StatusCode } catch {}
+      Write-Output ('__PS_STATUS__' + $code)
+      Write-Output $_.Exception.Message
+      exit 1
+    } catch {
+      Write-Output '__PS_STATUS__0'
+      Write-Output $_.Exception.Message
+      exit 1
+    }
+  `;
 
-    const result = execSync(`powershell.exe -NoProfile -Command "${psCommand}"`, {
+  try {
+    const result: string = execSync('powershell.exe -NoProfile -Command -', {
+      input: psScript,
       encoding: 'utf8',
       timeout: 10000,
       windowsHide: true,
     });
 
+    const lines = result.split(/\r?\n/);
+    let status = 0;
+    let body = result;
+    const statusIdx = lines.findIndex((l) => l.startsWith('__PS_STATUS__'));
+    if (statusIdx >= 0) {
+      status = parseInt(lines[statusIdx].slice('__PS_STATUS__'.length), 10) || 0;
+      body = lines.slice(statusIdx + 1).join('\n').trim();
+    }
+
     return {
-      ok: true,
-      status: 200,
-      json: async () => JSON.parse(result.trim())
+      ok: status >= 200 && status < 300,
+      status,
+      json: async () => JSON.parse(body) as unknown,
+      text: async () => body,
     };
-  } catch (error: any) {
+  } catch (error: unknown) {
+    const errObj = error as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string };
+    const stderr = (errObj?.stderr || errObj?.stdout || '').toString();
     return {
       ok: false,
       status: 0,
-      json: async () => { throw error; }
+      json: async () => { throw new Error(`windowsFetch failed: ${stderr || errObj?.message || 'unknown'}`); },
+      text: async () => stderr,
     };
   }
 }
@@ -175,8 +215,12 @@ export class CometCDPClient {
   private lastTargetId: string | undefined;
   private reconnectAttempts: number = 0;
   private maxReconnectAttempts: number = 5;
-  private isReconnecting: boolean = false;
-
+  // M1 fix: promise-mutex instead of a boolean. Two concurrent failed ops
+  // used to each increment reconnectAttempts and race to call reconnect()
+  // simultaneously. Now: the first caller to fail starts a single reconnect
+  // promise; subsequent callers await the same promise instead of duplicating
+  // work or compounding the counter.
+  private reconnectPromise: Promise<void> | null = null;
   get isConnected(): boolean {
     return this.state.connected && this.client !== null;
   }
@@ -218,11 +262,19 @@ export class CometCDPClient {
   }
 
   /**
-   * Auto-reconnect wrapper for operations with exponential backoff
+   * Auto-reconnect wrapper for operations with exponential backoff.
+   *
+   * M1 fix: replaced the `isReconnecting: boolean` flag with a single shared
+   * `reconnectPromise` mutex. The old flag had two races:
+   *   1. Two concurrent failed ops would each call `reconnect()` simultaneously.
+   *   2. The fixed 1s sleep between checks was a busy-wait, not a real queue.
+   *
+   * New: first failing op acquires the mutex and runs backoff+reconnect.
+   * Any concurrent failing op awaits the same promise and reuses the result.
    */
   private async withAutoReconnect<T>(operation: () => Promise<T>): Promise<T> {
-    if (this.isReconnecting) {
-      await new Promise(resolve => setTimeout(resolve, 1000));
+    if (this.reconnectPromise) {
+      try { await this.reconnectPromise; } catch { /* swallow: this op retries */ }
     }
 
     try {
@@ -236,26 +288,28 @@ export class CometCDPClient {
         'WebSocket', 'CLOSED', 'not open', 'disconnected',
         'ECONNREFUSED', 'ECONNRESET', 'Protocol error', 'Target closed', 'Session closed'
       ];
-
-      if (connectionErrors.some(e => errorMessage.includes(e)) &&
-          this.reconnectAttempts < this.maxReconnectAttempts) {
-        this.reconnectAttempts++;
-        this.isReconnecting = true;
-
-        try {
-          const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 5000);
-          await new Promise(resolve => setTimeout(resolve, delay));
-          await this.reconnect();
-          this.isReconnecting = false;
-          return await operation();
-        } catch (reconnectError) {
-          this.isReconnecting = false;
-          throw reconnectError;
-        }
+      const looksLikeConnectionError = connectionErrors.some((e) => errorMessage.includes(e));
+      if (!looksLikeConnectionError || this.reconnectAttempts >= this.maxReconnectAttempts) {
+        throw error;
       }
 
-      throw error;
+      if (!this.reconnectPromise) {
+        this.reconnectAttempts++;
+        this.reconnectPromise = this.runReconnectWithBackoff().finally(() => {
+          this.reconnectPromise = null;
+        });
+      }
+      try { await this.reconnectPromise; } catch { /* reconnect failed — fall through to retry */ }
+
+      return await operation();
     }
+  }
+
+  private async runReconnectWithBackoff(): Promise<void> {
+    const attempt = this.reconnectAttempts;
+    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 5000);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    await this.reconnect();
   }
 
   /**
@@ -442,8 +496,19 @@ export class CometCDPClient {
           .trim().replace(/\r?\n/g, '');
         cometPath = `${localAppData}\\Perplexity\\Comet\\Application\\Comet.exe`;
       } catch {
-        cometPath = 'C:\\Users\\' + (process.env.USER || 'user') +
-          '\\AppData\\Local\\Perplexity\\Comet\\Application\\Comet.exe';
+        // L3 fix: prefer the real Windows username via whoami so paths with
+        // spaces (e.g. "First Last") or non-ASCII characters don't break the
+        // fallback. Only fall back to $USER if even whoami fails.
+        let winUser = '';
+        try {
+          winUser = execSync('powershell.exe -NoProfile -Command "(whoami.exe)"', {
+            encoding: 'utf8',
+            timeout: 5000,
+            windowsHide: true,
+          }).split(/[\\]/).pop()?.trim() ?? '';
+        } catch { /* ignore */ }
+        if (!winUser) winUser = process.env.USER || 'user';
+        cometPath = `C:\\Users\\${winUser}\\AppData\\Local\\Perplexity\\Comet\\Application\\Comet.exe`;
       }
 
       try {
@@ -455,16 +520,27 @@ export class CometCDPClient {
         }).unref();
 
         // Wait for Comet to start
-        return new Promise((resolve, reject) => {
+        return new Promise<string>((resolve, reject) => {
           const maxAttempts = 40;
           let attempts = 0;
+          // H4 fix: settled flag stops the recursive setTimeout chain from
+          // continuing after resolve/reject fires. Without this, attempts
+          // 2..40 keep firing windowsFetch against a dead port after Comet
+          // already started (or after timeout).
+          let settled = false;
+          const settle = (fn: () => void) => {
+            if (settled) return;
+            settled = true;
+            fn();
+          };
 
           const checkReady = async () => {
+            if (settled) return;
             attempts++;
             try {
               const response = await windowsFetch(`http://127.0.0.1:${port}/json/version`);
               if (response.ok) {
-                resolve(`Comet started via WSL->PowerShell on port ${port}`);
+                settle(() => resolve(`Comet started via WSL->PowerShell on port ${port}`));
                 return;
               }
             } catch { /* keep trying */ }
@@ -472,10 +548,10 @@ export class CometCDPClient {
             if (attempts < maxAttempts) {
               setTimeout(checkReady, 500);
             } else {
-              reject(new Error(
+              settle(() => reject(new Error(
                 `Timeout waiting for Comet. Tried to launch: ${cometPath}\n` +
                 `Try manually: powershell.exe -Command "Start-Process '${cometPath}' -ArgumentList '--remote-debugging-port=${port}'"`
-              ));
+              )));
             }
           };
 
@@ -515,13 +591,21 @@ export class CometCDPClient {
 
         const maxAttempts = 40;
         let attempts = 0;
+        // H4 fix: see WSL branch — same settled-flag pattern.
+        let settled = false;
+        const settle = (fn: () => void) => {
+          if (settled) return;
+          settled = true;
+          fn();
+        };
 
         const checkReady = async () => {
+          if (settled) return;
           attempts++;
           try {
             const response = await windowsFetch(`http://127.0.0.1:${port}/json/version`);
             if (response.ok) {
-              resolve(`Comet started with debug port ${port}`);
+              settle(() => resolve(`Comet started with debug port ${port}`));
               return;
             }
           } catch { /* keep trying */ }
@@ -529,7 +613,7 @@ export class CometCDPClient {
           if (attempts < maxAttempts) {
             setTimeout(checkReady, 500);
           } else {
-            reject(new Error(`Timeout waiting for Comet. Try: "${COMET_PATH}" --remote-debugging-port=${port}`));
+            settle(() => reject(new Error(`Timeout waiting for Comet. Try: "${COMET_PATH}" --remote-debugging-port=${port}`)));
           }
         };
 
@@ -565,8 +649,16 @@ export class CometCDPClient {
 
       const maxAttempts = 40;
       let attempts = 0;
+      // H4 fix: see WSL branch — same settled-flag pattern.
+      let settled = false;
+      const settle = (fn: () => void) => {
+        if (settled) return;
+        settled = true;
+        fn();
+      };
 
       const checkReady = async () => {
+        if (settled) return;
         attempts++;
         try {
           const controller = new AbortController();
@@ -576,7 +668,7 @@ export class CometCDPClient {
 
           if (response.ok) {
             const version = await response.json() as CDPVersion;
-            resolve(`Comet started with debug port ${port}: ${version.Browser}`);
+            settle(() => resolve(`Comet started with debug port ${port}: ${version.Browser}`));
             return;
           }
         } catch { /* keep trying */ }
@@ -584,7 +676,7 @@ export class CometCDPClient {
         if (attempts < maxAttempts) {
           setTimeout(checkReady, 500);
         } else {
-          reject(new Error(`Timeout waiting for Comet. Try: ${COMET_PATH} --remote-debugging-port=${port}`));
+          settle(() => reject(new Error(`Timeout waiting for Comet. Try: ${COMET_PATH} --remote-debugging-port=${port}`)));
         }
       };
 
@@ -752,15 +844,18 @@ export class CometCDPClient {
   }
 
   /**
-   * Execute JavaScript in the page context
+   * Execute JavaScript in the page context.
+   *
+   * L4 fix: previously this bypassed the health check and auto-reconnect
+   * wrapper. Callers in `comet_ask` polled with `evaluate` every 2s — if the
+   * CDP WebSocket dropped mid-task, they would surface a raw "WebSocket
+   * CLOSED" error instead of reconnecting transparently. Now `evaluate`
+   * delegates to `safeEvaluate` so every caller gets the same reliability
+   * guarantees. `safeEvaluate` remains the explicit "this must survive
+   * reconnects" signal for call sites that want to be loud about intent.
    */
   async evaluate(expression: string): Promise<EvaluateResult> {
-    this.ensureConnected();
-    return this.client!.Runtime.evaluate({
-      expression,
-      awaitPromise: true,
-      returnByValue: true,
-    }) as Promise<EvaluateResult>;
+    return this.safeEvaluate(expression);
   }
 
   /**
@@ -779,6 +874,24 @@ export class CometCDPClient {
         returnByValue: true,
       }) as Promise<EvaluateResult>;
     });
+  }
+
+  /**
+   * H6 fix: replace deprecated `document.execCommand('insertText', ...)`.
+   * H6 fix: replace deprecated `document.execCommand('insertText', ...)`.
+   * The execCommand path is a no-op for programmatic calls on modern Chromium
+   * (no synthetic `input` event fires), which causes React-driven UIs like
+   * Perplexity to never see the typed text — the "prompt not submitted"
+   * failure mode. `Input.insertText` dispatches keyDown/char/keyUp events
+   * that React listeners process normally. Available since Chrome 79.
+   */
+  async insertText(text: string): Promise<void> {
+    this.ensureConnected();
+    const client = this.client as unknown as { Input?: { insertText?: (args: { text: string }) => Promise<unknown> } } | null;
+    if (!client?.Input?.insertText) {
+      throw new Error("CDP Input.insertText domain not available on this target");
+    }
+    await client.Input.insertText({ text });
   }
 
   /**

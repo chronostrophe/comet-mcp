@@ -143,8 +143,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "comet_connect": {
         // Auto-start Comet with debug port (will restart if running without it)
         const startResult = await cometClient.startComet(9222);
-
-        // Get all tabs and clean up - close all except one
         const targets = await cometClient.listTargets();
         const pageTabs = targets.filter(t => t.type === 'page');
 
@@ -215,22 +213,32 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           await cometClient.navigate("https://www.perplexity.ai/", true);
           await new Promise(resolve => setTimeout(resolve, 1500));
         } else {
-          // Not newChat - just ensure we're on Perplexity
+          // H5 fix: previously a null tabs.main was silently ignored, then
+          // the subsequent evaluate() would throw on an unconnected client,
+          // surfacing a cryptic CDP error. Be explicit: ask the caller to
+          // either pass newChat:true or call comet_connect first.
           const tabs = await cometClient.listTabsCategorized();
-          if (tabs.main) {
-            await cometClient.connect(tabs.main.id);
+          if (!tabs.main) {
+            return {
+              content: [{
+                type: "text",
+                text: "Error: not on a Perplexity page. Call comet_connect first, or re-run comet_ask with newChat:true.",
+              }],
+              isError: true,
+            };
           }
+          await cometClient.connect(tabs.main.id);
 
+          // Null-safe evaluate (companion to H1 fix in comet-ai.ts).
           const urlResult = await cometClient.evaluate('window.location.href');
-          const currentUrl = urlResult.result.value as string;
-          const isOnPerplexity = currentUrl?.includes('perplexity.ai');
+          const currentUrl = (urlResult.result?.value as string | undefined) ?? '';
+          const isOnPerplexity = currentUrl.includes('perplexity.ai');
 
           if (!isOnPerplexity) {
             await cometClient.navigate("https://www.perplexity.ai/", true);
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
         }
-
         // Capture old response state BEFORE sending prompt (for follow-up detection)
         const oldStateResult = await cometClient.evaluate(`
           (() => {
@@ -242,14 +250,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             };
           })()
         `);
-        const oldState = oldStateResult.result.value as { count: number; lastText: string };
-
-        // Send the prompt
-        await cometAI.sendPrompt(prompt);
+        const oldState = (oldStateResult.result?.value as { count?: number; lastText?: string } | undefined)
+          ?? { count: 0, lastText: '' };
 
         // Wait for completion
         const startTime = Date.now();
-        const stepsCollected: string[] = [];
+        // M4 fix: Set gives O(1) dedup across all polls. Order is preserved by
+        // insertion (steps arrive from the server in execution order). On
+        // display we materialize an array and slice to the most recent N.
+        const stepsSeen = new Set<string>();
         let sawNewResponse = false;
 
         while (Date.now() - startTime < timeout) {
@@ -266,23 +275,24 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               };
             })()
           `);
-          const currentState = currentStateResult.result.value as { count: number; lastText: string };
+          const currentState = (currentStateResult.result?.value as { count?: number; lastText?: string } | undefined)
+            ?? { count: 0, lastText: '' };
 
           // Detect new response
           if (!sawNewResponse) {
-            if (currentState.count > oldState.count ||
-                (currentState.lastText && currentState.lastText !== oldState.lastText)) {
+            const oldCount = oldState?.count ?? 0;
+            const oldText = oldState?.lastText ?? '';
+            if ((currentState.count ?? 0) > oldCount ||
+                ((currentState.lastText ?? '') && (currentState.lastText ?? '') !== oldText)) {
               sawNewResponse = true;
             }
           }
 
           const status = await cometAI.getAgentStatus();
 
-          // Collect steps
+          // Collect steps (O(1) per step instead of O(n))
           for (const step of status.steps) {
-            if (!stepsCollected.includes(step)) {
-              stepsCollected.push(step);
-            }
+            stepsSeen.add(step);
           }
 
           // Task completed - return result directly (but only if we saw a NEW response)
@@ -290,10 +300,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             return { content: [{ type: "text", text: status.response || 'Task completed (no response text extracted)' }] };
           }
         }
-
         // Still working after initial wait - return "in progress" (non-blocking)
         const finalStatus = await cometAI.getAgentStatus();
-        let inProgressMsg = `Task in progress (${stepsCollected.length} steps so far).\n`;
+        const recentSteps = Array.from(stepsSeen).slice(-8);
+        let inProgressMsg = `Task in progress (${stepsSeen.size} steps so far).\n`;
         inProgressMsg += `Status: ${finalStatus.status.toUpperCase()}\n`;
         if (finalStatus.currentStep) {
           inProgressMsg += `Current: ${finalStatus.currentStep}\n`;
@@ -301,8 +311,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (finalStatus.agentBrowsingUrl) {
           inProgressMsg += `Browsing: ${finalStatus.agentBrowsingUrl}\n`;
         }
-        if (stepsCollected.length > 0) {
-          inProgressMsg += `\nSteps:\n${stepsCollected.map(s => `  • ${s}`).join('\n')}\n`;
+        if (recentSteps.length > 0) {
+          inProgressMsg += `\nSteps:\n${recentSteps.map(s => `  • ${s}`).join('\n')}\n`;
         }
         inProgressMsg += `\nUse comet_poll to check progress or comet_stop to cancel.`;
 
@@ -329,7 +339,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         }
 
         if (status.steps.length > 0) {
-          output += `\nSteps:\n${status.steps.map(s => `  • ${s}`).join('\n')}\n`;
+          // M2 fix: cap displayed steps at the last 10. getAgentStatus() now
+          // returns ALL unique steps so callers can see the full timeline;
+          // this is the right place to truncate for human readability.
+          const displaySteps = status.steps.slice(-10);
+          output += `\nSteps (${status.steps.length} total, showing last ${displaySteps.length}):\n${displaySteps.map(s => `  • ${s}`).join('\n')}\n`;
         }
 
         if (status.status === 'working') {
@@ -532,17 +546,41 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const slices = await cometClient.captureContinuousPageScreenshots(maxSlices);
         return { content: [{ type: "text", text: `Captured ${slices.length} continuous viewport screenshots with 10% overlap.` }] };
       }
-
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
-  } catch (error) {
+  } catch (error: unknown) {
+    // M3 + L5: include stack only when DEBUG=1, and redact URLs that may
+    const err = error as { message?: string; stack?: string };
+    const baseMessage = err?.message ?? String(error);
+    const safeMessage = baseMessage.replace(/\b(https?:\/\/[^\s)]+|ws:\/\/[^\s)]+)/g, '[url]');
+    const debug = process.env.DEBUG && process.env.DEBUG !== '0' && process.env.DEBUG !== 'false';
+    const detail = debug && err?.stack
+      ? `\n${err.stack.split('\n').slice(0, 6).join('\n')}`
+      : '';
     return {
-      content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : error}` }],
+      content: [{ type: "text", text: `Error: ${safeMessage}${detail}` }],
       isError: true,
     };
   }
 });
 
 const transport = new StdioServerTransport();
-server.connect(transport);
+
+// A2 fix: clean close of the CDP WebSocket on SIGINT/SIGTERM. Without this,
+// process kill leaves Comet with a dangling debugger attach which can stall
+// the next comet_connect attempt. `cometClient.disconnect()` is idempotent
+// (safe to call when no client is connected).
+let shuttingDown = false;
+const shutdown = async (signal: string) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  try {
+    await cometClient.disconnect();
+  } catch { /* best-effort cleanup */ }
+  process.exit(0);
+};
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+
+await server.connect(transport);

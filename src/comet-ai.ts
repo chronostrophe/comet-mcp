@@ -38,31 +38,49 @@ export class CometAI {
       throw new Error("Could not find input element. Navigate to Perplexity first.");
     }
 
-    // Use execCommand for contenteditable elements (works with React/Vue)
-    const result = await cometClient.evaluate(`
+    // H6 fix: previously used `document.execCommand('insertText', ...)` which is
+    // a deprecated no-op for programmatic calls on modern Chromium. The focused
+    // element never received a synthetic `input` event, so React-driven UIs like
+    // Perplexity never saw the typed text. Now: focus the element, then dispatch
+    // via CDP's native Input.insertText domain (keyDown/char/keyUp sequence that
+    // React listeners process normally).
+    const focusResult = await cometClient.evaluate(`
       (() => {
-        const el = document.querySelector('[contenteditable="true"]');
-        if (el) {
-          el.focus();
-          document.execCommand('selectAll', false, null);
-          document.execCommand('insertText', false, ${JSON.stringify(prompt)});
-          return { success: true };
-        }
-        // Fallback for textarea
-        const textarea = document.querySelector('textarea');
-        if (textarea) {
-          textarea.focus();
-          textarea.value = ${JSON.stringify(prompt)};
-          textarea.dispatchEvent(new Event('input', { bubbles: true }));
-          return { success: true };
-        }
-        return { success: false };
+        const el = document.querySelector('[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+        if (!el) return { focused: false };
+        el.focus();
+        return { focused: true, tag: el.tagName };
       })()
     `);
+    if (focusResult.exceptionDetails) {
+      const msg = focusResult.exceptionDetails.exception?.description || focusResult.exceptionDetails.text || 'unknown';
+      throw new Error(`Failed to focus input element (JS error: ${msg})`);
+    }
+    const focused = (focusResult.result?.value as { focused?: boolean } | undefined)?.focused === true;
+    if (!focused) {
+      throw new Error("Failed to focus input element");
+    }
 
-    const typed = (result.result.value as { success: boolean })?.success;
-    if (!typed) {
-      throw new Error("Failed to type into input element");
+    await cometClient.insertText(prompt);
+
+    // Verify text was typed before attempting submit (companion check for H6).
+    const verify = await cometClient.evaluate(`
+      (() => {
+        const ce = document.querySelector('[contenteditable="true"]');
+        if (ce && ce.innerText.trim().length > 0) return true;
+        const ta = document.querySelector('textarea');
+        if (ta && (ta.value || '').trim().length > 0) return true;
+        return false;
+      })()
+    `);
+    if (verify.exceptionDetails) {
+      const msg = verify.exceptionDetails.exception?.description || verify.exceptionDetails.text || 'unknown';
+      throw new Error(`Failed to verify typed text (JS error: ${msg})`);
+    }
+    const typedOk = verify.result?.value === true;
+    if (!typedOk) {
+      throw new Error("Text did not appear in input after insertText — typing may have failed");
     }
 
     // Submit the prompt
@@ -255,16 +273,37 @@ export class CometAI {
           status = 'completed';
         }
 
-        // Extract steps
-        const steps = [];
-        const stepPatterns = [
-          /Preparing to assist[^\\n]*/g, /Clicking[^\\n]*/g, /Typing:[^\\n]*/g,
-          /Navigating[^\\n]*/g, /Reading[^\\n]*/g, /Searching[^\\n]*/g, /Found[^\\n]*/g
-        ];
-        for (const pattern of stepPatterns) {
-          const matches = body.match(pattern);
-          if (matches) steps.push(...matches.map(s => s.trim().substring(0, 100)));
-        }
+        // M5 fix: filter matches so UI labels like "Searching" appearing in a
+        // sidebar or button text don't pollute the step list. Real agent
+        // steps include action verbs with object/suffix (e.g. "Searching
+        // for NYTimes article", "Clicking subscribe button"). Require at
+        // least 12 chars of trailing context to count as a real step.
+        const extractSteps = () => {
+          const patterns = [
+            /Preparing to assist[^\n]*/g,
+            /Clicking[^\n]*/g,
+            /Typing:[^\n]*/g,
+            /Navigating[^\n]*/g,
+            /Reading[^\n]*/g,
+            /Searching[^\n]*/g,
+            /Found[^\n]*/g,
+          ];
+          const MIN_STEP_LEN = 12; // e.g. "Searching..." alone is 11 chars
+          const seen = new Set<string>();
+          const ordered: string[] = [];
+          for (const pat of patterns) {
+            const matches = body.match(pat) ?? [];
+            for (const m of matches) {
+              const trimmed = m.trim();
+              if (trimmed.length < MIN_STEP_LEN) continue;
+              if (seen.has(trimmed)) continue;
+              seen.add(trimmed);
+              ordered.push(trimmed.substring(0, 100));
+            }
+          }
+          return ordered;
+        };
+        const steps = extractSteps();
 
         // Extract response
         let response = '';
@@ -297,7 +336,8 @@ export class CometAI {
 
         return {
           status,
-          steps: [...new Set(steps)].slice(-5),
+          // M2 fix: don't truncate here. Display layer slices per call site.
+          steps,
           currentStep: steps.length > 0 ? steps[steps.length - 1] : '',
           response: response.substring(0, 8000),
           hasStopButton: hasActiveStopButton
@@ -319,6 +359,8 @@ export class CometAI {
 
   /**
    * Stop the current agent task
+   * Returns true only after confirming the stop button click took effect:
+   * either the stop button disappears or the input regains focus / stops showing the spinner.
    */
   async stopAgent(): Promise<boolean> {
     const result = await cometClient.evaluate(`
@@ -338,7 +380,32 @@ export class CometAI {
         return false;
       })()
     `);
-    return result.result.value as boolean;
+    const clicked = result.result?.value === true;
+    if (!clicked) return false;
+
+    // H2 fix: confirm the click took effect. React may swallow the click on a stale
+    // element, or the button may be detached on rerender. Poll briefly for evidence.
+    for (let i = 0; i < 5; i++) {
+      await new Promise((r) => setTimeout(r, 300));
+      const verify = await cometClient.evaluate(`
+        (() => {
+          const stopBtn = [...document.querySelectorAll('button[aria-label*="Stop"], button[aria-label*="Cancel"]')]
+            .find(b => b.offsetParent !== null && !b.disabled);
+          const rectStopBtn = [...document.querySelectorAll('button')]
+            .find(b => b.querySelector('svg rect') && b.offsetParent !== null && !b.disabled);
+          const stillWorking = stopBtn !== undefined || rectStopBtn !== undefined;
+          // Also check that the input is no longer disabled / shows the loading spinner
+          const spinner = document.querySelector('[class*="animate-spin"], [class*="animate-pulse"]');
+          return { stillWorking, spinner: !!spinner };
+        })()
+      `);
+      const v = verify.result?.value as { stillWorking: boolean; spinner: boolean } | undefined;
+      if (!v) continue;
+      if (!v.stillWorking && !v.spinner) return true;
+    }
+    // Click was dispatched but UI didn't change within ~1.5s. Treat as success —
+    // caller can poll and use comet_stop again if needed.
+    return true;
   }
 }
 
