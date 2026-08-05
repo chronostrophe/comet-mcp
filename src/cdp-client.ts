@@ -14,8 +14,9 @@ import type {
   CometState,
   ElementFingerprint,
 } from "./types.js";
-import sitePlaybooks from "./site-playbooks.json" with { type: "json" };
+import { createPlaybookStore } from "./site/playbook-store.js";
 
+const sitePlaybookStore = createPlaybookStore();
 // ============ PLATFORM DETECTION ============
 
 /**
@@ -1396,27 +1397,34 @@ export class CometCDPClient {
    * Site Playbook Resolver & Pre-Injection Engine (Guard 1 & 2):
    * 1. Subdomain / Wildcard Domain Suffix Matching (mail.google.com -> google.com / gmail.com, gist.github.com -> github.com)
    * 2. Smart Fallback Engine: Falls back to AXTree + Physical Hardware Dispatch if domain lacks custom playbook
+   *
+   * Backed by a hot-loaded store: $COMET_PLAYBOOKS_DIR -> ~/.comet-mcp/playbooks.json
+   * -> bundled defaults. Call `reloadSitePlaybooks()` to pick up disk changes
+   * without restarting the MCP server.
    */
   getSitePlaybook(urlOrDomain: string): { domain: string; skill: string } | null {
     if (!urlOrDomain) return null;
     let targetHost = urlOrDomain.toLowerCase();
     try {
       if (urlOrDomain.startsWith('http://') || urlOrDomain.startsWith('https://')) {
-        targetHost = new URL(urlOrDomain).hostname.toLowerCase();
+        targetHost = new URL(urlOrDomain).host.toLowerCase();
       }
-    } catch { /* use raw string */ }
+    } catch { /* leave as-is */ }
+    return sitePlaybookStore.find(targetHost);
+  }
 
-    // Direct match
-    const directMatch = sitePlaybooks.find(p => p.domain.toLowerCase() === targetHost);
-    if (directMatch) return directMatch;
+  /**
+   * Force a reload of site playbooks from disk. Returns the new entry count.
+   */
+  reloadSitePlaybooks(): number {
+    return sitePlaybookStore.reload();
+  }
 
-    // Wildcard / Suffix match
-    const suffixMatch = sitePlaybooks.find(p => {
-      const pDom = p.domain.toLowerCase();
-      return targetHost.endsWith('.' + pDom) || pDom.endsWith('.' + targetHost);
-    });
-
-    return suffixMatch || null;
+  /**
+   * Where the live playbook source came from (null = bundled defaults).
+   */
+  sitePlaybookSource(): string | null {
+    return sitePlaybookStore.sourcePath();
   }
 
   /**
@@ -1426,11 +1434,11 @@ export class CometCDPClient {
   async safeEvaluateWithPlaybook(expression: string, currentUrl?: string): Promise<EvaluateResult> {
     const playbook = currentUrl ? this.getSitePlaybook(currentUrl) : null;
     const injectedExpression = playbook ? `
-      (() => {
-        window.__COMET_SITE_PLAYBOOK__ = ${JSON.stringify(playbook.skill)};
-        return (${expression});
-      })()
-    ` : expression;
+       (() => {
+         window.__COMET_SITE_PLAYBOOK__ = ${JSON.stringify(playbook.skill)};
+         return (${expression});
+       })()
+     ` : expression;
     return this.safeEvaluate(injectedExpression);
   }
 

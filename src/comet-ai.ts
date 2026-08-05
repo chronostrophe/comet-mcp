@@ -29,6 +29,68 @@ export class CometAI {
   }
 
   /**
+   * T2.5 comet_plan: focus the input, type the prompt via CDP insertText, and
+   * return the text that landed in the box. Does NOT submit. Useful for the
+   * `comet_plan` tool to preview what will be sent before calling
+   * `comet_ask`. After preview, the caller should `clearPrompt()` (or
+   * continue with `comet_ask`).
+   */
+  async previewPrompt(prompt: string): Promise<{ focused: boolean; renderedText: string; tag: string | null }> {
+    const focusResult = await cometClient.evaluate(`
+      (() => {
+        const el = document.querySelector('[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+        if (!el) return { focused: false, renderedText: '', tag: null };
+        el.focus();
+        return { focused: true, renderedText: '', tag: el.tagName };
+      })()
+    `);
+    if (focusResult.exceptionDetails) {
+      throw new Error(`Failed to focus input element (JS error: ${focusResult.exceptionDetails.text || 'unknown'})`);
+    }
+    const focused = (focusResult.result?.value as { focused?: boolean } | undefined)?.focused === true;
+    if (!focused) {
+      return { focused: false, renderedText: '', tag: null };
+    }
+    await cometClient.insertText(prompt);
+    const verify = await cometClient.evaluate(`
+      (() => {
+        const ce = document.querySelector('[contenteditable="true"]');
+        if (ce && ce.innerText) return { renderedText: ce.innerText.trim() };
+        const ta = document.querySelector('textarea');
+        if (ta && ta.value) return { renderedText: ta.value.trim() };
+        return { renderedText: '' };
+      })()
+    `);
+    const tag = (focusResult.result?.value as { tag?: string } | undefined)?.tag ?? null;
+    const renderedText = (verify.result?.value as { renderedText?: string } | undefined)?.renderedText ?? '';
+    return { focused: true, renderedText, tag };
+  }
+
+  /**
+   * Clear the input box. Used after previewPrompt so the input doesn't stay
+   * populated. Selects all and deletes via the keyboard.
+   */
+  async clearPrompt(): Promise<boolean> {
+    return cometClient.evaluate(`
+      (() => {
+        const el = document.querySelector('[contenteditable="true"]') ||
+                   document.querySelector('textarea');
+        if (!el) return false;
+        el.focus();
+        const range = document.createRange();
+        range.selectNodeContents(el);
+        const sel = window.getSelection();
+        if (sel) {
+          sel.removeAllRanges();
+          sel.addRange(range);
+        }
+        return document.execCommand('delete');
+      })()
+    `).then(r => r.result?.value === true).catch(() => false);
+  }
+
+  /**
    * Send a prompt to Comet's AI (Perplexity)
    */
   async sendPrompt(prompt: string): Promise<string> {
