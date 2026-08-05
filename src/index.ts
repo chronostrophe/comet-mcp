@@ -13,6 +13,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { cometClient } from "./cdp-client.js";
 import { cometAI } from "./comet-ai.js";
+import { formatCaughtError, isDebugEnabled } from "./util/format.js";
 
 const TOOLS: Tool[] = [
   {
@@ -550,22 +551,18 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         throw new Error(`Unknown tool: ${name}`);
     }
   } catch (error: unknown) {
-    // M3 + L5: include stack only when DEBUG=1, and redact URLs that may
-    const err = error as { message?: string; stack?: string };
-    const baseMessage = err?.message ?? String(error);
-    const safeMessage = baseMessage.replace(/\b(https?:\/\/[^\s)]+|ws:\/\/[^\s)]+)/g, '[url]');
-    const debug = process.env.DEBUG && process.env.DEBUG !== '0' && process.env.DEBUG !== 'false';
-    const detail = debug && err?.stack
-      ? `\n${err.stack.split('\n').slice(0, 6).join('\n')}`
-      : '';
+    // M3 + L5: route through pure helpers so the redaction and DEBUG rules
+    // are exercised by the unit tests.
+    const formatted = formatCaughtError(error, { debug: isDebugEnabled() });
     return {
-      content: [{ type: "text", text: `Error: ${safeMessage}${detail}` }],
+      content: [{ type: "text", text: `Error: ${formatted}` }],
       isError: true,
     };
   }
 });
 
 const transport = new StdioServerTransport();
+
 
 // A2 fix: clean close of the CDP WebSocket on SIGINT/SIGTERM. Without this,
 // process kill leaves Comet with a dangling debugger attach which can stall
@@ -584,3 +581,4 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 
 await server.connect(transport);
+
