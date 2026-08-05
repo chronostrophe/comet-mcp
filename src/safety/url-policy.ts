@@ -3,6 +3,7 @@
 // extension, per Zenity's reversing story). Pure functions, no CDP.
 
 import { readFileSync, existsSync } from 'node:fs';
+import { recordAllow, recordDenial } from './audit-log.js';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -236,6 +237,29 @@ export function assertUrlAllowed(url: string, policy: UrlPolicy = DEFAULT_POLICY
   if (!result.allowed) {
     throw new BlockedUrlError(url, result.reason ?? 'malformed-url', result.message ?? 'URL blocked');
   }
+}
+
+/**
+ * Side-effectful wrapper around `checkUrl`: evaluates the URL against the
+ * policy AND records the decision to the audit log. Use this from call
+ * sites that drive the browser (navigate, newTab, connect target check).
+ * `caller` is the MCP tool name (or 'manual' for direct invocations).
+ *
+ * Returns the same UrlCheckResult as `checkUrl` so callers can branch on it
+ * without re-doing the work.
+ */
+export function evaluateUrl(
+  url: string,
+  policy: UrlPolicy = DEFAULT_POLICY,
+  caller: string = 'manual',
+): UrlCheckResult {
+  const result = checkUrl(url, policy);
+  if (result.allowed) {
+    recordAllow(caller, url);
+  } else {
+    recordDenial(caller, url, result.reason ?? 'malformed-url', result.message ?? 'URL blocked');
+  }
+  return result;
 }
 
 // ---- Mutable in-memory policy holder ----
