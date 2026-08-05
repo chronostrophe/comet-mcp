@@ -107,8 +107,20 @@ describe('isBlockedDocType', () => {
     expect(isBlockedDocType('https://x.com/index.html')).toBe(false);
   });
 
+  it('does NOT false-positive on .com / .app / .jar TLDs in the host', () => {
+    expect(isBlockedDocType('https://example.com')).toBe(false);
+    expect(isBlockedDocType('https://myapp.app/foo')).toBe(false);
+    expect(isBlockedDocType('https://api.jar/file')).toBe(false);
+  });
+
   it('returns false for empty input', () => {
     expect(isBlockedDocType('')).toBe(false);
+  });
+
+  it('returns false for paths without file extensions', () => {
+    expect(isBlockedDocType('https://x.com/')).toBe(false);
+    expect(isBlockedDocType('https://x.com/foo')).toBe(false);
+    expect(isBlockedDocType('https://x.com/foo/bar')).toBe(false);
   });
 });
 
@@ -157,10 +169,17 @@ describe('checkUrl', () => {
     expect(r.allowed).toBe(true);
   });
 
-  it('blocks chrome:// when blockInternal is true (default)', () => {
-    const r = checkUrl('chrome://settings');
+  it('blocks chrome:// when blockInternal is explicitly true', () => {
+    const r = checkUrl('chrome://settings', { ...DEFAULT_POLICY, blockInternal: true });
     expect(r.allowed).toBe(false);
     expect(r.reason).toBe('internal-scheme');
+  });
+
+  it('allows chrome:// when blockInternal is false (default)', () => {
+    // Default policy has blockInternal=false — internal URLs are NOT blocked.
+    // Opt in with setActivePolicy or comet_set_url_policy.
+    const r = checkUrl('chrome://settings');
+    expect(r.allowed).toBe(true);
   });
 
   it('blocks file:// when blockFile is true (default)', () => {
@@ -220,14 +239,6 @@ describe('checkUrl', () => {
     expect(checkUrl(undefined).reason).toBe('malformed-url');
   });
 
-  it('blocks chrome:// when blockInternal is explicitly false', () => {
-    const r = checkUrl('chrome://settings', {
-      ...DEFAULT_POLICY,
-      blockInternal: false,
-    });
-    expect(r.allowed).toBe(true);
-  });
-
   it('rejects URLs with no host when policy lists patterns', () => {
     const r = checkUrl('file:///etc/passwd', {
       ...DEFAULT_POLICY,
@@ -245,12 +256,12 @@ describe('assertUrlAllowed', () => {
   });
 
   it('throws BlockedUrlError on disallowed URL', () => {
-    expect(() => assertUrlAllowed('chrome://settings')).toThrow(BlockedUrlError);
+    expect(() => assertUrlAllowed('chrome://settings', { ...DEFAULT_POLICY, blockInternal: true })).toThrow(BlockedUrlError);
   });
 
   it('BlockedUrlError carries url, reason, and message', () => {
     try {
-      assertUrlAllowed('chrome://settings');
+      assertUrlAllowed('chrome://settings', { ...DEFAULT_POLICY, blockInternal: true });
       expect.fail('should have thrown');
     } catch (e) {
       expect(e).toBeInstanceOf(BlockedUrlError);
@@ -275,6 +286,14 @@ describe('policyRegistry', () => {
     expect(p.blockDangerousExtensions).toBe(DEFAULT_POLICY.blockDangerousExtensions);
   });
 
+  it('default policy is permissive on internal URLs', () => {
+    // Confirms the decision: only file:// and executable docs are blocked
+    // by default. chrome:// and devtools:// are not.
+    expect(DEFAULT_POLICY.blockInternal).toBe(false);
+    expect(DEFAULT_POLICY.blockFile).toBe(true);
+    expect(DEFAULT_POLICY.blockDangerousExtensions).toBe(true);
+  });
+
   it('setActivePolicy replaces and getActivePolicy returns a defensive copy', () => {
     setActivePolicy({ ...DEFAULT_POLICY, domainAllowlist: ['a.com'] });
     const p1 = getActivePolicy();
@@ -288,22 +307,24 @@ describe('policyRegistry', () => {
   it('resetActivePolicy restores defaults', () => {
     setActivePolicy({ blockInternal: false, blockFile: false, blockDangerousExtensions: false });
     resetActivePolicy();
-    expect(getActivePolicy().blockInternal).toBe(true);
+    expect(getActivePolicy().blockInternal).toBe(false);
+    expect(getActivePolicy().blockFile).toBe(true);
   });
 });
 
 describe('normalizePolicy', () => {
   it('fills in defaults for missing boolean flags', () => {
     const p = normalizePolicy({ domainAllowlist: ['x.com'] });
-    expect(p.blockInternal).toBe(true);
+    expect(p.blockInternal).toBe(false);
     expect(p.blockFile).toBe(true);
     expect(p.blockDangerousExtensions).toBe(true);
     expect(p.domainAllowlist).toEqual(['x.com']);
   });
 
-  it('honors explicit false overrides', () => {
-    const p = normalizePolicy({ blockInternal: false });
-    expect(p.blockInternal).toBe(false);
+  it('honors explicit overrides', () => {
+    const p = normalizePolicy({ blockInternal: true, blockFile: false });
+    expect(p.blockInternal).toBe(true);
+    expect(p.blockFile).toBe(false);
   });
 
   it('drops unknown keys', () => {

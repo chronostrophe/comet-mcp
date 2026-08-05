@@ -52,7 +52,7 @@ export interface UrlPolicy {
 
 /** A permissive default — blocks the dangerous stuff, allows everything else. */
 export const DEFAULT_POLICY: UrlPolicy = {
-  blockInternal: true,
+  blockInternal: false,
   blockFile: true,
   blockDangerousExtensions: true,
 };
