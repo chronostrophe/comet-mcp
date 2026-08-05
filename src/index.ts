@@ -14,6 +14,17 @@ import {
 import { cometClient } from "./cdp-client.js";
 import { cometAI } from "./comet-ai.js";
 import { formatCaughtError, isDebugEnabled } from "./util/format.js";
+import {
+  OBSERVE_PAGE_EXPRESSION,
+  extractAnswerSince,
+  defaultTimeoutForMode,
+  type PageObservation,
+} from "./util/dom.js";
+import {
+  COMET_MODES,
+  MODE_DESCRIPTIONS,
+  SELECT_MODE_EXPRESSION,
+} from "./util/select-mode.js";
 
 const TOOLS: Tool[] = [
   {
@@ -29,7 +40,12 @@ const TOOLS: Tool[] = [
       properties: {
         prompt: { type: "string", description: "Question or task for Comet - focus on goals and context" },
         newChat: { type: "boolean", description: "Start a fresh conversation (default: false)" },
-        timeout: { type: "number", description: "Max wait time in ms (default: 15000 = 15s)" },
+        timeout: { type: "number", description: "Max wait time in ms. Default depends on mode: search=15s, labs=45s, research=90s." },
+        mode: {
+          type: "string",
+          enum: ["search", "research", "labs", "learn"],
+          description: "Optional mode hint for default timeout selection. Does NOT switch the mode — call comet_mode for that."
+        },
       },
       required: ["prompt"],
     },
@@ -177,8 +193,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "comet_ask": {
         let prompt = args?.prompt as string;
-        const timeout = (args?.timeout as number) || 15000; // Default 15s, use poll for longer tasks
-        const newChat = (args?.newChat as boolean) || false;
+        const explicitTimeout = args?.timeout as number | undefined;
+        const newChat = args?.newChat as boolean | undefined;
+        const modeHint = args?.mode as string | undefined;
+        // T1.1: research-mode prompts are genuinely long. Pick a default timeout
+        // based on the requested mode when the caller hasn't set one.
+        const timeout = defaultTimeoutForMode(modeHint, explicitTimeout);
 
         // Validate prompt
         if (!prompt || prompt.trim().length === 0) {
@@ -194,7 +214,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
         // For newChat: full reset (same as comet_connect) to handle post-agentic state
         if (newChat) {
-          // Clean up extra tabs (fixes CDP state after agentic browsing)
           const targets = await cometClient.listTargets();
           const pageTabs = targets.filter(t => t.type === 'page');
           if (pageTabs.length > 1) {
@@ -203,21 +222,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             }
           }
 
-          // Fresh connect to remaining tab
           const freshTargets = await cometClient.listTargets();
           const mainTab = freshTargets.find(t => t.type === 'page');
           if (mainTab) {
             await cometClient.connect(mainTab.id);
           }
 
-          // Navigate to Perplexity home
           await cometClient.navigate("https://www.perplexity.ai/", true);
           await new Promise(resolve => setTimeout(resolve, 1500));
         } else {
-          // H5 fix: previously a null tabs.main was silently ignored, then
-          // the subsequent evaluate() would throw on an unconnected client,
-          // surfacing a cryptic CDP error. Be explicit: ask the caller to
-          // either pass newChat:true or call comet_connect first.
           const tabs = await cometClient.listTabsCategorized();
           if (!tabs.main) {
             return {
@@ -230,7 +243,6 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
           await cometClient.connect(tabs.main.id);
 
-          // Null-safe evaluate (companion to H1 fix in comet-ai.ts).
           const urlResult = await cometClient.evaluate('window.location.href');
           const currentUrl = (urlResult.result?.value as string | undefined) ?? '';
           const isOnPerplexity = currentUrl.includes('perplexity.ai');
@@ -240,77 +252,108 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
         }
-        // Capture old response state BEFORE sending prompt (for follow-up detection)
-        const oldStateResult = await cometClient.evaluate(`
-          (() => {
-            const proseEls = document.querySelectorAll('[class*="prose"]');
-            const lastProse = proseEls[proseEls.length - 1];
-            return {
-              count: proseEls.length,
-              lastText: lastProse ? lastProse.innerText.substring(0, 100) : ''
-            };
-          })()
-        `);
-        const oldState = (oldStateResult.result?.value as { count?: number; lastText?: string } | undefined)
-          ?? { count: 0, lastText: '' };
 
-        // Wait for completion
-        const startTime = Date.now();
-        // M4 fix: Set gives O(1) dedup across all polls. Order is preserved by
-        // insertion (steps arrive from the server in execution order). On
-        // display we materialize an array and slice to the most recent N.
-        const stepsSeen = new Set<string>();
-        let sawNewResponse = false;
+        // Capture baseline page state BEFORE submitting. We use it as the
+        // marker for "new answer arrived" (T1.4) instead of just diffing
+        // last-text, which misses multi-section answers.
+        const baselineResult = await cometClient.evaluate(OBSERVE_PAGE_EXPRESSION);
+        const baseline = (baselineResult.result?.value as Partial<PageObservation> | undefined)
+          ?? { proseCount: 0, proseTexts: [] };
+        const baselineCount = baseline.proseCount ?? 0;
 
-        while (Date.now() - startTime < timeout) {
-          await new Promise(resolve => setTimeout(resolve, 2000)); // Poll every 2s
+        // Send prompt + submit
+        await cometAI.sendPrompt(prompt);
 
-          // Check if we have a NEW response (more prose elements or different text)
-          const currentStateResult = await cometClient.evaluate(`
+        // T1.3: submit-receipt. After Enter, poll briefly for proseCount to
+        // start climbing or for the loading spinner to appear. If neither
+        // happens within 5s the submit likely didn't fire — fall back to
+        // clicking the visible Submit/Send button.
+        let submitConfirmed = false;
+        for (let i = 0; i < 5; i++) {
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          const probe = await cometClient.evaluate(OBSERVE_PAGE_EXPRESSION);
+          const v = probe.result?.value as Partial<PageObservation> | undefined;
+          const proseGrowing = (v?.proseCount ?? 0) > baselineCount;
+          const spinner = v?.hasLoadingSpinner === true;
+          const stopAppeared = v?.hasStopButton === true;
+          if (proseGrowing || spinner || stopAppeared) {
+            submitConfirmed = true;
+            break;
+          }
+        }
+        if (!submitConfirmed) {
+          // Try clicking the visible submit/send button as a fallback.
+          const clicked = await cometClient.evaluate(`
             (() => {
-              const proseEls = document.querySelectorAll('[class*="prose"]');
-              const lastProse = proseEls[proseEls.length - 1];
-              return {
-                count: proseEls.length,
-                lastText: lastProse ? lastProse.innerText.substring(0, 100) : ''
-              };
+              const selectors = [
+                'button[aria-label*="Submit"]',
+                'button[aria-label*="Send"]',
+                'button[type="submit"]',
+              ];
+              for (const sel of selectors) {
+                const btn = document.querySelector(sel);
+                if (btn && !btn.disabled && btn.offsetParent !== null) {
+                  btn.click();
+                  return true;
+                }
+              }
+              return false;
             })()
           `);
-          const currentState = (currentStateResult.result?.value as { count?: number; lastText?: string } | undefined)
-            ?? { count: 0, lastText: '' };
+          // Whether or not the click landed, we continue — the polling loop
+          // will surface the result either way.
+        }
 
-          // Detect new response
+        // Poll for completion. We capture both proseTexts and steps so the
+        // final response can include everything since baseline.
+        const startTime = Date.now();
+        const stepsSeen = new Set<string>();
+        let sawNewResponse = false;
+        let lastProseTexts: string[] = [];
+
+        while (Date.now() - startTime < timeout) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+
+          const obsResult = await cometClient.evaluate(OBSERVE_PAGE_EXPRESSION);
+          const obs = (obsResult.result?.value as Partial<PageObservation> | undefined)
+            ?? { proseCount: 0, proseTexts: [] };
+
           if (!sawNewResponse) {
-            const oldCount = oldState?.count ?? 0;
-            const oldText = oldState?.lastText ?? '';
-            if ((currentState.count ?? 0) > oldCount ||
-                ((currentState.lastText ?? '') && (currentState.lastText ?? '') !== oldText)) {
+            if ((obs.proseCount ?? 0) > baselineCount) {
               sawNewResponse = true;
             }
           }
+          lastProseTexts = obs.proseTexts ?? [];
 
           const status = await cometAI.getAgentStatus();
+          for (const step of status.steps) stepsSeen.add(step);
 
-          // Collect steps (O(1) per step instead of O(n))
-          for (const step of status.steps) {
-            stepsSeen.add(step);
-          }
-
-          // Task completed - return result directly (but only if we saw a NEW response)
           if (status.status === 'completed' && sawNewResponse) {
-            return { content: [{ type: "text", text: status.response || 'Task completed (no response text extracted)' }] };
+            // T1.4: full prose capture from baseline forward. The AI status's
+            // `response` field falls back to the LAST prose element, which
+            // drops preceding sections of multi-section answers.
+            const assembled = extractAnswerSince(lastProseTexts, baselineCount);
+            const text = assembled
+              || status.response
+              || 'Task completed (no response text extracted)';
+            return { content: [{ type: "text", text }] };
           }
         }
-        // Still working after initial wait - return "in progress" (non-blocking)
+
+        // Timed out — still working. Capture what we have so far.
         const finalStatus = await cometAI.getAgentStatus();
         const recentSteps = Array.from(stepsSeen).slice(-8);
-        let inProgressMsg = `Task in progress (${stepsSeen.size} steps so far).\n`;
+        let inProgressMsg = `Task in progress (${stepsSeen.size} steps so far, timeout ${Math.round(timeout / 1000)}s reached).\n`;
         inProgressMsg += `Status: ${finalStatus.status.toUpperCase()}\n`;
         if (finalStatus.currentStep) {
           inProgressMsg += `Current: ${finalStatus.currentStep}\n`;
         }
         if (finalStatus.agentBrowsingUrl) {
           inProgressMsg += `Browsing: ${finalStatus.agentBrowsingUrl}\n`;
+        }
+        const partial = extractAnswerSince(lastProseTexts, baselineCount, 4000);
+        if (partial) {
+          inProgressMsg += `\nPartial answer so far:\n${partial}\n`;
         }
         if (recentSteps.length > 0) {
           inProgressMsg += `\nSteps:\n${recentSteps.map(s => `  • ${s}`).join('\n')}\n`;
@@ -370,134 +413,105 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           content: [{ type: "image", data: result.data, mimeType: "image/png" }],
         };
       }
-
       case "comet_mode": {
         const mode = args?.mode as string | undefined;
 
-        // If no mode provided, show current mode
+        // Validate mode argument up front so the caller gets a clear error
+        // instead of a silent default to 'search'.
+        if (mode !== undefined && !COMET_MODES.includes(mode as typeof COMET_MODES[number])) {
+          return {
+            content: [{ type: "text", text: `Invalid mode: ${mode}. Use: ${COMET_MODES.join(', ')}` }],
+            isError: true,
+          };
+        }
+
+        // No mode arg: show current mode + descriptions.
         if (!mode) {
           const result = await cometClient.evaluate(`
             (() => {
-              // Try button group first (wide screen)
+              // Wide-screen button group: which aria-label has data-state=checked?
               const modes = ['Search', 'Research', 'Labs', 'Learn'];
-              for (const mode of modes) {
-                const btn = document.querySelector('button[aria-label="' + mode + '"]');
+              for (const m of modes) {
+                const btn = document.querySelector('button[aria-label="' + m + '"]');
                 if (btn && btn.getAttribute('data-state') === 'checked') {
-                  return mode.toLowerCase();
+                  return m.toLowerCase();
                 }
               }
-              // Try dropdown (narrow screen) - look for the mode selector button
+              // Narrow-screen dropdown: text on the trigger button
               const dropdownBtn = document.querySelector('button[class*="gap"]');
               if (dropdownBtn) {
                 const text = dropdownBtn.innerText.toLowerCase();
-                if (text.includes('search')) return 'search';
-                if (text.includes('research')) return 'research';
-                if (text.includes('labs')) return 'labs';
-                if (text.includes('learn')) return 'learn';
+                for (const m of ['search', 'research', 'labs', 'learn']) {
+                  if (text.includes(m)) return m;
+                }
               }
               return 'search';
             })()
           `);
-
-          const currentMode = result.result.value as string;
-          const descriptions: Record<string, string> = {
-            search: 'Basic web search',
-            research: 'Deep research with comprehensive analysis',
-            labs: 'Analytics, visualizations, and coding',
-            learn: 'Educational content and explanations'
-          };
+          const currentMode = (result.result?.value as string) ?? 'search';
 
           let output = `Current mode: ${currentMode}\n\nAvailable modes:\n`;
-          for (const [m, desc] of Object.entries(descriptions)) {
-            const marker = m === currentMode ? "→" : " ";
-            output += `${marker} ${m}: ${desc}\n`;
+          for (const m of COMET_MODES) {
+            const marker = m === currentMode ? '→' : ' ';
+            output += `${marker} ${m}: ${MODE_DESCRIPTIONS[m]}\n`;
           }
-
           return { content: [{ type: "text", text: output }] };
         }
 
-        // Switch mode
-        const modeMap: Record<string, string> = {
-          search: "Search",
-          research: "Research",
-          labs: "Labs",
-          learn: "Learn",
-        };
-        const ariaLabel = modeMap[mode];
-        if (!ariaLabel) {
-          return {
-            content: [{ type: "text", text: `Invalid mode: ${mode}. Use: search, research, labs, learn` }],
-            isError: true,
-          };
-        }
-
-        // Navigate to Perplexity first if not there
+        // Switch mode. Ensure we're on a Perplexity page first.
         const state = cometClient.currentState;
-        if (!state.currentUrl?.includes("perplexity.ai")) {
-          await cometClient.navigate("https://www.perplexity.ai/", true);
+        if (!state.currentUrl?.includes('perplexity.ai')) {
+          await cometClient.navigate('https://www.perplexity.ai/', true);
         }
 
-        // Try both UI patterns: button group (wide) and dropdown (narrow)
-        const result = await cometClient.evaluate(`
-          (() => {
-            // Strategy 1: Direct button (wide screen)
-            const btn = document.querySelector('button[aria-label="${ariaLabel}"]');
-            if (btn) {
-              btn.click();
-              return { success: true, method: 'button' };
-            }
+        // Pass the mode as a string arg to SELECT_MODE_EXPRESSION so we don't
+        // need to escape any user-provided characters.
+        const result = await cometClient.evaluate(
+          `(${SELECT_MODE_EXPRESSION})(${JSON.stringify(mode)})`
+        );
+        const clickResult = result.result?.value as
+          | { success: boolean; method?: string; needsSelect?: boolean; attempted?: string[]; error?: string }
+          | undefined;
 
-            // Strategy 2: Dropdown menu (narrow screen)
-            // Find and click the dropdown trigger (button with current mode text)
-            const allButtons = document.querySelectorAll('button');
-            for (const b of allButtons) {
-              const text = b.innerText.toLowerCase();
-              if ((text.includes('search') || text.includes('research') ||
-                   text.includes('labs') || text.includes('learn')) &&
-                  b.querySelector('svg')) {
-                b.click();
-                return { success: true, method: 'dropdown-open', needsSelect: true };
-              }
-            }
-
-            return { success: false, error: "Mode selector not found" };
-          })()
-        `);
-
-        const clickResult = result.result.value as { success: boolean; method?: string; needsSelect?: boolean; error?: string };
-
-        if (clickResult.success && clickResult.needsSelect) {
-          // Wait for dropdown to open, then select the mode
-          await new Promise(resolve => setTimeout(resolve, 300));
+        if (clickResult?.success && clickResult.needsSelect) {
+          // Strategy 3 opened a dropdown — pick the menu item.
+          await new Promise((r) => setTimeout(r, 300));
           const selectResult = await cometClient.evaluate(`
             (() => {
-              // Look for dropdown menu items
               const items = document.querySelectorAll('[role="menuitem"], [role="option"], button');
               for (const item of items) {
-                if (item.innerText.toLowerCase().includes('${mode}')) {
+                if (item.innerText.toLowerCase().includes(${JSON.stringify(mode)})) {
                   item.click();
                   return { success: true };
                 }
               }
-              return { success: false, error: "Mode option not found in dropdown" };
+              return { success: false, error: 'Mode option not found in dropdown' };
             })()
           `);
-          const selectRes = selectResult.result.value as { success: boolean; error?: string };
-          if (selectRes.success) {
+          const sel = selectResult.result?.value as { success: boolean; error?: string } | undefined;
+          if (sel?.success) {
             return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
-          } else {
-            return { content: [{ type: "text", text: `Failed: ${selectRes.error}` }], isError: true };
           }
-        }
-
-        if (clickResult.success) {
-          return { content: [{ type: "text", text: `Switched to ${mode} mode` }] };
-        } else {
           return {
-            content: [{ type: "text", text: `Failed to switch mode: ${clickResult.error}` }],
+            content: [{ type: "text", text: `Failed: ${sel?.error ?? 'unknown'}` }],
             isError: true,
           };
         }
+
+        if (clickResult?.success) {
+          return {
+            content: [{ type: "text", text: `Switched to ${mode} mode (via ${clickResult.method})` }],
+          };
+        }
+
+        const attempted = (clickResult?.attempted ?? []).join(', ') || 'none';
+        return {
+          content: [{
+            type: "text",
+            text: `Failed to switch mode: ${clickResult?.error ?? 'unknown'} (attempted: ${attempted})`,
+          }],
+          isError: true,
+        };
       }
 
       case "comet_ax_tree_coords": {
