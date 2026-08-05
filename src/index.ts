@@ -150,6 +150,26 @@ const TOOLS: Tool[] = [
       }
     }
   },
+  {
+    name: "comet_get_url_policy",
+    description: "Read the active URL policy. Mirrors Comet-agent's isInternalPage / isUrlBlocked / isDomainBlacklist checks. Shows blockInternal, blockFile, blockDangerousExtensions, and the optional allow/deny domain lists.",
+    inputSchema: { type: "object", properties: {} },
+  },
+  {
+    name: "comet_set_url_policy",
+    description: "Set or reset the URL policy that gates every navigation and tab-open. Pass any of blockInternal / blockFile / blockDangerousExtensions / domainAllowlist / domainDenylist to update; omit all to reset to defaults. Or set reset:true to restore defaults.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        blockInternal: { type: "boolean", description: "Block chrome://, edge://, devtools://, etc. Default false." },
+        blockFile: { type: "boolean", description: "Block file:// and ftp://. Default true." },
+        blockDangerousExtensions: { type: "boolean", description: "Block URLs ending with executable extensions (.exe, .sh, .dmg, etc). Default true." },
+        domainAllowlist: { type: "array", items: { type: "string" }, description: "Wildcard domains allowed (e.g. ['*.mycompany.com']). If set and non-empty, ONLY these are allowed." },
+        domainDenylist: { type: "array", items: { type: "string" }, description: "Wildcard domains always blocked. Wins over allowlist." },
+        reset: { type: "boolean", description: "If true, restore all flags to defaults and clear the lists." },
+      },
+    },
+  },
 ];
 
 const server = new Server(
