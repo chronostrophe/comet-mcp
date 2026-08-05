@@ -39,6 +39,7 @@ import {
 import { getAuditLog } from "./safety/audit-log.js";
 import { getTaskRegistry, type CreateTaskResult, type TaskStatusResult } from "./mcp/tasks.js";
 import { runBackgroundTask, readTask, listTasks } from "./mcp/task-runner.js";
+import { listProgressWidget, readProgressWidget, progressWidgetUri } from "./mcp/widgets.js";
 
 const TOOLS: Tool[] = [
   {
@@ -308,6 +309,30 @@ server.setRequestHandler(CancelTaskRequestSchema, async (req) => {
   return { taskId: req.params.taskId, cancelled: ok };
 });
 
+// MCP Apps: resources/list + resources/read. The widget lives at
+// ui://comet-mcp/progress.html and is rendered inside the MCP client's chat
+// when a comet_research result includes _meta.ui.resourceUri.
+import { ListResourcesRequestSchema, ReadResourceRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+// Cast the handlers to `as never` because the SDK's setRequestHandler
+// overload infers the schema's strict result shape, but our plain object
+// types are spec-equivalent and runtime-safe.
+server.setRequestHandler(ListResourcesRequestSchema, async () => listProgressWidget() as never);
+server.setRequestHandler(ReadResourceRequestSchema, (async (req: { params: { uri: string } }) => {
+  const uri = req.params.uri;
+  if (uri.startsWith("ui://comet-mcp/progress.html")) {
+    try {
+      const u = new URL(uri);
+      const taskId = u.searchParams.get("taskId") ?? "unknown";
+      const status = u.searchParams.get("status") as 'working' | 'completed' | 'failed' | 'cancelled' | null;
+      const message = u.searchParams.get("message") ?? undefined;
+      return readProgressWidget({ taskId, status: status ?? undefined, message }) as never;
+    } catch {
+      return readProgressWidget({ taskId: "unknown" }) as never;
+    }
+  }
+  throw new Error(`Resource not found: ${uri}`);
+}) as never);
+
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const { name, arguments: args } = request.params;
 
@@ -535,12 +560,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           { statusMessage: `researching: ${prompt.slice(0, 60)}` },
         );
         const result: CreateTaskResult = { isTask: true, task };
+        // MCP Apps: surface a widget the client can render to track the task.
+        // The widget is just HTML fetched via resources/read on the same URI.
+        const widgetUri = progressWidgetUri(task.taskId);
         return {
           content: [{
             type: "text",
             text: JSON.stringify(result, null, 2),
           }],
-        };
+          _meta: {
+            "io.modelcontextprotocol/ui": {
+              resourceUri: widgetUri,
+            },
+          },
+        } as never;
       }
 
       case "comet_poll_task": {
