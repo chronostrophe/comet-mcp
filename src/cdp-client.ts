@@ -15,6 +15,7 @@ import type {
   ElementFingerprint,
 } from "./types.js";
 import { createPlaybookStore } from "./site/playbook-store.js";
+import { assertUrlAllowed, getActivePolicy } from "./safety/url-policy.js";
 
 const sitePlaybookStore = createPlaybookStore();
 // ============ PLATFORM DETECTION ============
@@ -826,10 +827,16 @@ export class CometCDPClient {
   }
 
   /**
-   * Navigate to a URL
+   * Navigate to a URL.
+   *
+   * Hard-boundary check: assertUrlAllowed(url, currentPolicy) runs before
+   * the CDP call. Mirrors Perplexity Comet isInternalPage / isUrlBlocked /
+   * isDomainBlacklist. Throws BlockedUrlError on deny (caught by the MCP
+   * catch handler and surfaced via formatCaughtError).
    */
   async navigate(url: string, waitForLoad: boolean = true): Promise<NavigateResult> {
     this.ensureConnected();
+    assertUrlAllowed(url, getActivePolicy());
     const result = await this.client!.Page.navigate({ url });
     if (waitForLoad) await this.client!.Page.loadEventFired();
     this.state.currentUrl = url;

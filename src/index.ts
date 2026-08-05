@@ -25,6 +25,13 @@ import {
   MODE_DESCRIPTIONS,
   SELECT_MODE_EXPRESSION,
 } from "./util/select-mode.js";
+import {
+  getActivePolicy,
+  setActivePolicy,
+  resetActivePolicy,
+  normalizePolicy,
+  type UrlPolicy,
+} from "./safety/url-policy.js";
 
 const TOOLS: Tool[] = [
   {
@@ -561,6 +568,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const slices = await cometClient.captureContinuousPageScreenshots(maxSlices);
         return { content: [{ type: "text", text: `Captured ${slices.length} continuous viewport screenshots with 10% overlap.` }] };
       }
+
+      case "comet_get_url_policy": {
+        const p = getActivePolicy();
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(p, null, 2),
+          }],
+        };
+      }
+
+      case "comet_set_url_policy": {
+        const reset = args?.reset === true;
+        if (reset) {
+          resetActivePolicy();
+          const p = getActivePolicy();
+          return {
+            content: [{
+              type: "text",
+              text: `URL policy reset to defaults.
+${JSON.stringify(p, null, 2)}`,
+            }],
+          };
+        }
+        // Build the next policy from the current one, overriding any
+        // fields the caller supplied. Undefined values are left alone
+        // so partial updates work.
+        const current = getActivePolicy();
+        const next: UrlPolicy = {
+          ...current,
+          ...(typeof args?.blockInternal === 'boolean' ? { blockInternal: args.blockInternal } : {}),
+          ...(typeof args?.blockFile === 'boolean' ? { blockFile: args.blockFile } : {}),
+          ...(typeof args?.blockDangerousExtensions === 'boolean' ? { blockDangerousExtensions: args.blockDangerousExtensions } : {}),
+          ...(Array.isArray(args?.domainAllowlist) ? { domainAllowlist: args.domainAllowlist as string[] } : {}),
+          ...(Array.isArray(args?.domainDenylist) ? { domainDenylist: args.domainDenylist as string[] } : {}),
+        };
+        const normalized = normalizePolicy(next);
+        setActivePolicy(normalized);
+        return {
+          content: [{
+            type: "text",
+            text: `URL policy updated.
+${JSON.stringify(getActivePolicy(), null, 2)}`,
+          }],
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
