@@ -21,6 +21,7 @@ import {
   normalizePolicy,
   type UrlPolicy,
 } from "./safety/url-policy.js";
+import { getAuditLog } from "./safety/audit-log.js";
 
 const TOOLS: Tool[] = [
   {
@@ -90,6 +91,23 @@ const TOOLS: Tool[] = [
       },
     },
   },
+  {
+    name: "comet_get_audit_log",
+    description: "Read the URL-policy audit log (most recent decisions, newest first). Optional limit and outcome filter (allow|deny).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        limit: { type: "number", description: "Maximum number of entries to return (default 50)" },
+        outcome: { type: "string", enum: ["allow", "deny"], description: "Optional filter by outcome" },
+        caller: { type: "string", description: "Optional filter by MCP tool name (exact match)" },
+      },
+    },
+  },
+  {
+    name: "comet_reset_audit_log",
+    description: "Clear the URL-policy audit log. Use this after diagnosing a blocked-navigation report to start fresh.",
+    inputSchema: { type: "object", properties: {} },
+  },
 ];
 
 const server = new Server(
@@ -128,13 +146,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (anyPage) {
           await cometClient.connect(anyPage.id);
           // Always navigate to Perplexity home for clean state
-          await cometClient.navigate("https://www.perplexity.ai/", true);
+          await cometClient.navigate("https://www.perplexity.ai/", true, "comet_connect");
           await new Promise(resolve => setTimeout(resolve, 1500));
           return { content: [{ type: "text", text: `${startResult}\nConnected to Perplexity (cleaned ${pageTabs.length - 1} old tabs)` }] };
         }
 
         // No tabs at all - create a new one
-        const newTab = await cometClient.newTab("https://www.perplexity.ai/");
+        const newTab = await cometClient.newTab("https://www.perplexity.ai/", "comet_connect");
         await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for page load
         await cometClient.connect(newTab.id);
         return { content: [{ type: "text", text: `${startResult}\nCreated new tab and navigated to Perplexity` }] };
@@ -176,7 +194,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           }
 
           // Navigate to Perplexity home
-          await cometClient.navigate("https://www.perplexity.ai/", true);
+          await cometClient.navigate("https://www.perplexity.ai/", true, "comet_ask");
           await new Promise(resolve => setTimeout(resolve, 1500));
         } else {
           // Not newChat - just ensure we're on Perplexity
@@ -190,7 +208,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           const isOnPerplexity = currentUrl?.includes('perplexity.ai');
 
           if (!isOnPerplexity) {
-            await cometClient.navigate("https://www.perplexity.ai/", true);
+            await cometClient.navigate("https://www.perplexity.ai/", true, "comet_ask");
             await new Promise(resolve => setTimeout(resolve, 2000));
           }
         }
@@ -491,6 +509,39 @@ ${JSON.stringify(p, null, 2)}`,
             type: "text",
             text: `URL policy updated.
 ${JSON.stringify(getActivePolicy(), null, 2)}`,
+          }],
+        };
+      }
+
+      case "comet_get_audit_log": {
+        const limit = Math.max(1, Math.min(500, (args?.limit as number) ?? 50));
+        const outcome = args?.outcome as string | undefined;
+        const caller = args?.caller as string | undefined;
+        let entries = getAuditLog().recent(limit);
+        if (outcome === "allow" || outcome === "deny") {
+          entries = entries.filter((e) => e.outcome === outcome);
+        }
+        if (caller) {
+          entries = entries.filter((e) => e.caller === caller);
+        }
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify(
+              { total: getAuditLog().size(), returned: entries.length, entries },
+              null,
+              2
+            ),
+          }],
+        };
+      }
+
+      case "comet_reset_audit_log": {
+        getAuditLog().clear();
+        return {
+          content: [{
+            type: "text",
+            text: "Audit log cleared.",
           }],
         };
       }
