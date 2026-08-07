@@ -8,3 +8,10 @@ demo-clear.gif
 DEBUG_MEMORY.md
 TEST_PLAN.md
 VISION.md
+
+# Scratch / generated files that should never be committed
+graphify-out/
+src/comet_interaction_events.jsonl
+src/comet_recorder.js
+src/network-engine.ts
+*.mjs
